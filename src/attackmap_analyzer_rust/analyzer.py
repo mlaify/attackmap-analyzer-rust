@@ -20,6 +20,8 @@ import re
 from pathlib import Path
 from urllib.parse import urlparse
 
+from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
+
 from .contracts import (
     AnalyzerMetadata,
     AuthHint,
@@ -34,7 +36,10 @@ from .contracts import (
 )
 
 CODE_SUFFIXES = {".rs"}
-SKIP_DIRS = {"target", ".git", "node_modules", ".cargo", "vendor"}
+# Rust-specific directories on top of the SDK defaults (which already cover
+# target/, vendor/, .git and node_modules). Matched against directory names
+# inside the repo only (mlaify/AttackMap#253).
+SKIP_DIRS = DEFAULT_SKIP_DIRS | {".cargo"}
 _SNIPPET_MAX_CHARS = 160
 
 
@@ -165,13 +170,10 @@ SECRET_PATTERNS: list[re.Pattern[str]] = [
 ]
 
 
-def _line_of(content: str, offset: int) -> int:
-    """1-indexed line for an offset in content."""
-    if offset <= 0:
-        return 1
-    return content.count("\n", 0, offset) + 1
-
-
+# Kept rather than attackmap.sdk.line_snippet: this takes a match offset and
+# splits on "\n" only, so it stays consistent with line_of() on files that
+# contain form feeds or other str.splitlines() separators, and it costs
+# O(line) per match instead of O(file).
 def _line_snippet(content: str, offset: int, *, max_chars: int = _SNIPPET_MAX_CHARS) -> str:
     line_start = content.rfind("\n", 0, offset) + 1
     line_end = content.find("\n", offset)
@@ -183,12 +185,9 @@ def _line_snippet(content: str, offset: int, *, max_chars: int = _SNIPPET_MAX_CH
     return line
 
 
-def _crate_name_from_cargo(cargo_path: Path) -> str | None:
-    if not cargo_path.exists():
-        return None
-    try:
-        text = cargo_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
+def _crate_name_from_cargo(cargo_path: Path, root: Path | None = None) -> str | None:
+    text = read_source(cargo_path, root=root)
+    if text is None:
         return None
     match = re.search(r'^\s*\[package\]\s*\n.*?^\s*name\s*=\s*"([^"]+)"', text, re.MULTILINE | re.DOTALL)
     if match:
@@ -196,12 +195,9 @@ def _crate_name_from_cargo(cargo_path: Path) -> str | None:
     return None
 
 
-def _workspace_members(cargo_path: Path) -> list[str]:
-    if not cargo_path.exists():
-        return []
-    try:
-        text = cargo_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
+def _workspace_members(cargo_path: Path, root: Path | None = None) -> list[str]:
+    text = read_source(cargo_path, root=root)
+    if text is None:
         return []
     block = re.search(r"\[workspace\][^\[]*?members\s*=\s*\[([^\]]*)\]", text, re.DOTALL)
     if not block:
@@ -235,15 +231,8 @@ class RustAnalyzer:
             return False
         if (root / "Cargo.toml").exists() or (root / "Cargo.lock").exists():
             return True
-        for path in root.rglob("Cargo.toml"):
-            if any(part in SKIP_DIRS for part in path.parts):
-                continue
-            return True
-        for path in root.rglob("*.rs"):
-            if any(part in SKIP_DIRS for part in path.parts):
-                continue
-            return True
-        return False
+        # Any nested Cargo.toml or .rs file; stop at the first one.
+        return next(iter_repo_files(root, suffixes=CODE_SUFFIXES, names={"Cargo.toml"}, skip_dirs=SKIP_DIRS), None) is not None
 
     def analyze(self, repo_path: str | Path) -> ScanResult:
         root = Path(repo_path).resolve()
@@ -251,29 +240,23 @@ class RustAnalyzer:
         if not root.exists() or not root.is_dir():
             return result
 
-        crate_name = _crate_name_from_cargo(root / "Cargo.toml")
-        workspace_members = _workspace_members(root / "Cargo.toml")
+        crate_name = _crate_name_from_cargo(root / "Cargo.toml", root)
+        workspace_members = _workspace_members(root / "Cargo.toml", root)
         if crate_name:
             self._append_unique_service(result, f"crate:{crate_name}", "Cargo.toml")
         for member in workspace_members:
             self._append_unique_service(result, f"workspace_member:{member}", "Cargo.toml")
 
-        for file_path in root.rglob("*.rs"):
-            if not file_path.is_file():
-                continue
-            if any(part in SKIP_DIRS for part in file_path.parts):
+        for file_path in iter_repo_files(root, suffixes=CODE_SUFFIXES, skip_dirs=SKIP_DIRS):
+            content = read_source(file_path, root=root)
+            if content is None:
                 continue
 
             result.files_scanned += 1
             if "rust" not in result.languages:
                 result.languages.append("rust")
 
-            try:
-                content = file_path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                continue
-
-            relative = str(file_path.relative_to(root))
+            relative = rel(file_path, root)
             self._extract_routes(content, relative, result)
             self._extract_databases(content, relative, result)
             self._extract_auth(content, relative, result)
@@ -295,7 +278,7 @@ class RustAnalyzer:
         _http_verbs = {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT"}
         for match in AXUM_ROUTE_PATTERN.finditer(content):
             path = match.group(1)
-            line = _line_of(content, match.start())
+            line = line_of(content, match.start())
             methods: set[str] = set()
             # First method is the one captured in group 2 (when it's an HTTP verb).
             first_call = match.group(2).split("::")[-1].upper()
@@ -320,18 +303,18 @@ class RustAnalyzer:
         # actix attribute routes: #[get("/path")] just above an fn
         for match in ACTIX_ATTRIBUTE_ROUTE_PATTERN.finditer(content):
             method, path = match.group(1).upper(), match.group(2)
-            self._append_unique_route(result, path, method, relative, _line_of(content, match.start()))
+            self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
 
         # actix .route(...): only fires when web:: namespace appears (so it doesn't double-count axum)
         for match in ACTIX_WEB_ROUTE_PATTERN.finditer(content):
             path, method = match.group(1), match.group(2).upper()
-            self._append_unique_route(result, path, method, relative, _line_of(content, match.start()))
+            self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
 
         # rocket attribute routes — same shape as actix attribute regex; emit only if rocket markers present.
         if "rocket" in content.lower():
             for match in ROCKET_ATTRIBUTE_ROUTE_PATTERN.finditer(content):
                 method, path = match.group(1).upper(), match.group(2)
-                self._append_unique_route(result, path, method, relative, _line_of(content, match.start()))
+                self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
 
     def _extract_databases(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern, kind in DB_PATTERNS:
@@ -342,7 +325,7 @@ class RustAnalyzer:
                 result,
                 kind,
                 relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
             )
 
@@ -355,7 +338,7 @@ class RustAnalyzer:
                 result,
                 hint,
                 relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
                 confidence,
             )
@@ -369,7 +352,7 @@ class RustAnalyzer:
                     result,
                     name,
                     relative,
-                    _line_of(content, match.start()),
+                    line_of(content, match.start()),
                     _line_snippet(content, match.start()),
                 )
 
@@ -384,7 +367,7 @@ class RustAnalyzer:
                     result,
                     target,
                     relative,
-                    _line_of(content, match.start()),
+                    line_of(content, match.start()),
                     _line_snippet(content, match.start()),
                 )
 
@@ -397,7 +380,7 @@ class RustAnalyzer:
                 result,
                 name,
                 relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
             )
 
@@ -410,7 +393,7 @@ class RustAnalyzer:
                 result,
                 hint,
                 relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
             )
 
