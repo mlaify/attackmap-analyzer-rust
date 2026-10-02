@@ -447,3 +447,174 @@ def test_symlinked_file_outside_repo_is_not_analyzed(tmp_path: Path) -> None:
     result = analyzer.analyze(repo)
     assert result.files_scanned == 0
     assert result.routes == []
+
+
+# ---------- Route.auth contract (AttackMap#256) ----------
+
+
+def _analyze_files(tmp_path: Path, files: dict[str, str]) -> dict:
+    for name, source in files.items():
+        target = tmp_path / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source, encoding="utf-8")
+    return {f"{r.method} {r.path}": r for r in RustAnalyzer().analyze(tmp_path).routes}
+
+
+_AXUM_MAIN = """
+use axum::{middleware, routing::{get, post, delete}, Router};
+use tower_http::trace::TraceLayer;
+
+mod handlers;
+
+fn protected_routes() -> Router<AppState> {
+    Router::new()
+        .route("/posts", post(handlers::create_post))
+        .route("/posts/:id", delete(handlers::delete_post))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        // Added after the route_layer, so outside it:
+        .route("/posts/preview", post(handlers::preview_post))
+}
+
+#[tokio::main]
+async fn main() {
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/comments", post(handlers::create_comment))
+        .route("/me", post(handlers::update_me))
+        .merge(protected_routes())
+        .layer(TraceLayer::new_for_http());
+    axum::serve(listener, app).await.unwrap();
+}
+"""
+
+_AXUM_HANDLERS = """
+pub async fn create_post(State(s): State<AppState>, Json(p): Json<NewPost>) -> impl IntoResponse {}
+pub async fn delete_post(Path(id): Path<i64>) -> impl IntoResponse {}
+pub async fn preview_post(claims: Option<Claims>, Json(p): Json<NewPost>) -> impl IntoResponse {}
+pub async fn create_comment(user: Option<AuthUser>, Json(c): Json<NewComment>) -> impl IntoResponse {}
+pub async fn update_me(claims: Claims, Json(b): Json<Me>) -> impl IntoResponse {}
+"""
+
+
+def test_axum_route_layer_and_extractor_guards_are_required(tmp_path: Path) -> None:
+    routes = _analyze_files(tmp_path, {"src/main.rs": _AXUM_MAIN, "src/handlers.rs": _AXUM_HANDLERS})
+    # route_layer in a router returned by fn and merged into the app.
+    create = routes["POST /posts"]
+    assert create.auth == "required"
+    assert create.guards == ["from_fn_with_state(require_auth)"]
+    assert create.guard_evidence == ".route_layer(middleware::from_fn_with_state(state.clone(), require_auth))"
+    assert routes["DELETE /posts/:id"].auth == "required"
+    # An auth extractor on the handler (defined in another file).
+    me = routes["POST /me"]
+    assert me.auth == "required"
+    assert me.guards == ["Claims"]
+    assert me.guard_evidence == "claims: Claims"
+    assert routes["GET /health"].auth == "unknown"
+
+
+def test_axum_optional_extractor_is_explicitly_public(tmp_path: Path) -> None:
+    routes = _analyze_files(tmp_path, {"src/main.rs": _AXUM_MAIN, "src/handlers.rs": _AXUM_HANDLERS})
+    comment = routes["POST /comments"]
+    assert comment.auth == "anonymous"
+    assert comment.guards == []
+    assert comment.guard_evidence == "user: Option<AuthUser>"
+
+
+def test_axum_route_after_route_layer_opts_out_of_it(tmp_path: Path) -> None:
+    routes = _analyze_files(tmp_path, {"src/main.rs": _AXUM_MAIN, "src/handlers.rs": _AXUM_HANDLERS})
+    # Same router as the guarded /posts, but registered after the route_layer.
+    preview = routes["POST /posts/preview"]
+    assert preview.auth == "anonymous"
+    assert preview.guard_evidence == "claims: Option<Claims>"
+
+
+def test_axum_unrecognised_or_hidden_layers_keep_optional_routes_unknown(tmp_path: Path) -> None:
+    routes = _analyze_files(
+        tmp_path,
+        {
+            "src/main.rs": """
+use axum::{middleware, routing::post, Router};
+async fn feed(user: Option<AuthUser>) {}
+async fn inbox(user: Option<AuthUser>) {}
+async fn login(session: AuthSession) {}
+fn main() {
+    let a = Router::new()
+        .route("/feed", post(feed))
+        .layer(middleware::from_fn(check_request));
+    let b = Router::new().route("/inbox", post(inbox)).route("/login", post(login));
+    let b = b.layer(AuthManagerLayerBuilder::new(backend, session_layer).build());
+    let c = b.layer(some_layer);
+}
+""",
+        },
+    )
+    # An unknown from_fn layer could be auth: an Option<..> handler isn't proof of public.
+    assert routes["POST /feed"].auth == "unknown"
+    # `b` is re-layered outside its chain, so its full layer path isn't visible.
+    assert routes["POST /inbox"].auth == "unknown"
+    # axum-login's AuthSession only loads the user; it doesn't reject.
+    assert routes["POST /login"].auth == "unknown"
+
+
+def test_actix_scope_wrap_and_optional_identity(tmp_path: Path) -> None:
+    routes = _analyze_files(
+        tmp_path,
+        {
+            "src/main.rs": """
+use actix_web::{web, App, HttpServer, post, put};
+use actix_web_httpauth::middleware::HttpAuthentication;
+
+#[post("/signup")]
+async fn signup(form: web::Json<Signup>, ident: Option<Identity>) -> HttpResponse { todo!() }
+
+#[put("/account")]
+async fn account(body: web::Json<Account>) -> HttpResponse { todo!() }
+
+#[actix_web::main]
+async fn main() {
+    HttpServer::new(|| {
+        App::new()
+            .wrap(Logger::default())
+            .service(signup)
+            .service(web::scope("/api").wrap(HttpAuthentication::bearer(validator)).service(account)
+                .route("/tokens", web::post().to(issue_token)))
+    }).bind(("0.0.0.0", 8080)).unwrap().run().await
+}
+""",
+        },
+    )
+    account = routes["PUT /account"]
+    assert account.auth == "required"
+    assert account.guards == ["HttpAuthentication::bearer"]
+    assert account.guard_evidence == ".wrap(HttpAuthentication::bearer(validator))"
+    assert routes["POST /tokens"].auth == "required"
+    assert routes["POST /signup"].auth == "anonymous"
+    assert routes["POST /signup"].guard_evidence == "ident: Option<Identity>"
+
+
+def test_rocket_request_guards(tmp_path: Path) -> None:
+    routes = _analyze_files(
+        tmp_path,
+        {
+            "src/main.rs": """
+use rocket::*;
+
+#[post("/notes", data = "<note>")]
+fn create_note(user: AuthUser, note: Json<Note>) -> Status { Status::Ok }
+
+#[post("/guestbook", data = "<entry>")]
+fn sign(user: Option<AuthUser>, entry: Json<Entry>) -> Status { Status::Ok }
+
+#[delete("/admin/<admin_id>")]
+fn remove(admin_id: AdminId) -> Status { Status::Ok }
+
+#[launch]
+fn rocket() -> _ { rocket::build() }
+""",
+        },
+    )
+    assert routes["POST /notes"].auth == "required"
+    assert routes["POST /notes"].guards == ["AuthUser"]
+    assert routes["POST /guestbook"].auth == "anonymous"
+    # `admin_id` is bound from the path, not a request guard.
+    assert routes["DELETE /admin/<admin_id>"].auth == "unknown"

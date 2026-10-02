@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — route-level auth (#5, AttackMap#256)
+
+- **Routes carry their auth in the core contract.** `Route.auth` is `required`, `anonymous` or `unknown`, with `guards` naming the layer or extractor and `guard_evidence` quoting it. AttackMap ≥ 0.6 trusts it over its own resolution, which can't read Rust, and over the ±40-line auth-hint window. Older cores ignore the fields, and the existing auth hints are unchanged.
+- **axum:** `.layer` / `.route_layer` wrap the routes added before them in a `Router::new()` chain. Routers bound with `let` or returned from `fn` are followed through `.merge` / `.nest` into the routers that mount them, across files (memoized, depth-bounded; several mount points must agree). Recognized auth layers: `middleware::from_fn[_with_state](<auth fn>)`, `from_extractor::<T>`, `RequireAuthorizationLayer`, `ValidateRequestHeaderLayer::bearer`, `login_required!`.
+- **actix-web:** `.wrap(HttpAuthentication::bearer(..))` (or another auth middleware) on `App::new()` / `web::scope(..)` guards every `.service(handler)` and `.route(..)` in it, nested scopes included.
+- **Extractors and request guards** (axum, actix, Rocket): a handler parameter typed `Claims`, `AuthUser`, `CurrentUser`, `BearerAuth`, `Identity`, `Jwt<..>`, `ApiKey`, … makes the route `required`. Handlers are found across files, and names defined twice stay unresolved. `Option<AuthUser>` is an explicit opt-in to anonymous callers. The route is `anonymous` only when no auth layer applies and every layer on its path is a known non-auth one. That also covers a route added after a `route_layer` in the same router. Rocket path/data params (`<id>`) are not guards.
+- Chain links may now be separated by comments. Brackets are matched in one cached pass per file, arguments are split by jumping over nested closures, and mount resolution is memoized, so adversarial input stays linear.
+
 ### Changed
 
 - Walk and read the repo with the shared `attackmap.sdk.fs` helpers
