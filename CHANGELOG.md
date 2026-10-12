@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — route prefixes and more frameworks (#2, AttackMap#261)
+
+- **Routes carry their full mounted path.** Routes are emitted after the whole repo is read, joined to the prefixes of every router that mounts them:
+  - **axum:** `.nest("/p", x)` / `.merge(x)` with an inline `Router::new()`, a `let` binding (nearest earlier one in the file) or a router fn (`x()` / `module::x()`, any file). Several `fn routes()` are told apart by module path (`users::routes` → `users.rs` / `users/mod.rs`) or by living in the caller's file; ambiguous mounts are left alone. A fn router returned as the body's tail expression (after inner items) is now recognized too.
+  - **actix-web:** `web::scope` / `web::resource` prefixes, nested scopes, `.configure(module::config)`, and `#[get]` handlers mounted with `.service(h)`. Bare `scope(..)` / `resource(..)` / `get()` count when imported from `actix_web`. `web::resource("/x").route(web::get().to(h))` and `.to(h)` are now routes (`ACTIX_RESOURCE_PATTERN` is no longer dead), as are `.route("", ..)` scope roots.
+  - **rocket:** `.mount("/base", routes![..])` and `.mount("/base", m::routes())` prefix the handlers they list.
+  - **New frameworks:** poem `Route::new().at(..).nest(..)`, salvo `Router::with_path(..).get(h).push(..)`, loco `Routes::new().prefix(..).add(..)` under `AppRoutes::..().prefix(..).add_route(..)`, warp `path!(..)` filters, tide `app.at(..).get(h)` (with `let api = app.at("/api")` receivers).
+- **Precision rules for mounts.** A `let` binding resolves only within the fn it's in, so a parameter with the same name as another fn's binding isn't a mount. A named router that nothing visible mounts is a known root only when it's handed to a server (`axum::serve(l, app)`, `.serve(app.into_make_service())`, poem `.run(app)`); otherwise, and under a non-literal prefix, its auth stays `unknown`. `let api = api.route(..)` rebindings continue the earlier router. `/api/` + `/` is `/api`. Frameworks that share builder names (salvo / axum `Router`, poem, loco) are told apart by `use` lines, not by words.
+- A router mounted at several prefixes yields one route per prefix, each with the auth layers on its own path (an auth `route_layer` added after `.nest("/admin", x)` but before `.nest("/preview", x)` guards only `/admin`). poem `.with`, salvo `.hoop`, loco `.layer` and actix `wrap` on resources are recognized auth layers.
+
+### Changed
+
+- **Extractor auth needs a visible impl.** A handler extractor named like auth (`AuthUser`, `Claims`, `CurrentUser`, `LoggedUser`, ...) makes a route `required` (or `Option<..>` `anonymous`) only when its `FromRequestParts` / `FromRequest` impl is in the repo, can reject (`type Rejection = Infallible` doesn't), checks credentials (reads an auth header, cookie, session or token), and rejects when they're missing (`ok_or(..)?` / `ok_or_else`, an early `return Err(..)`, `Err(..Unauthorized/Forbidden..)`, a rocket `Outcome::Error((Status::Unauthorized, ..))`, or a required `TypedHeader<Authorization<..>>`). An optional-user extractor that only parses a token when one is sent (`MaybeAuthUser`: `Ok(Self(headers.get(AUTHORIZATION).map(..).transpose()?))`), types named `Maybe*` / `Optional*` / `Opt*`, and a rejecting extractor that merely has an auth-like name (`AdminFilters`) don't count. This also fixes a false `required` on main for realworld-axum-sqlx's `GET /api/profiles/:username`. Library extractors `BearerAuth`, `BasicAuth`, `Identity` and loco `JWT` / `JWTWithUser` still count without one.
+- Handler signatures are resolved by module path / same file when a name is defined more than once, instead of giving up.
+- Route dedup uses a key set instead of scanning every emitted route (it was quadratic in the route count).
+- axum `.route("/x", get(h))` methods come only from that `.route(..)` call; text after it (e.g. a test's `client.post(..)`) no longer adds methods.
+
 ### Added — route-level auth (#5, AttackMap#256)
 
 - **Routes carry their auth in the core contract.** `Route.auth` is `required`, `anonymous` or `unknown`, with `guards` naming the layer or extractor and `guard_evidence` quoting it. AttackMap ≥ 0.6 trusts it over its own resolution, which can't read Rust, and over the ±40-line auth-hint window. Older cores ignore the fields, and the existing auth hints are unchanged.

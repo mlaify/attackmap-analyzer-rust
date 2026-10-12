@@ -17,7 +17,7 @@ This analyzer should:
 ## Scope
 Rust ecosystem coverage:
 
-- **Web frameworks**: axum, actix-web, rocket (routes + entrypoint markers)
+- **Web frameworks**: axum, actix-web, rocket, poem, salvo, loco, warp (`path!`), tide (routes with mounted prefixes + entrypoint markers)
 - **Databases**: sqlx, diesel, sea-orm, tokio-postgres, rusqlite, mongodb, redis, deadpool, AWS SDK (S3, DynamoDB)
 - **Auth crates**: jsonwebtoken, argon2/bcrypt/scrypt/password-hash, oauth2, axum-login, actix-identity, tower-sessions, tower-http::auth
 - **HTTP clients**: reqwest, isahc, surf, ureq (external call extraction)
