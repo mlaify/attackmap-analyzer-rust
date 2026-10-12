@@ -67,7 +67,7 @@ def join_path(prefix: str, path: str) -> str:
     if base == "/":
         return suffix
     if suffix == "/":
-        return base
+        return base.rstrip("/") or "/"
     return f"{base.rstrip('/')}/{suffix.lstrip('/')}"
 
 
@@ -88,7 +88,9 @@ _REF_HEAD = re.compile(
 )
 _CLOSURE_HEAD = re.compile(r"\s*(?:move\s*)?\|[^|]{0,200}\|\s*")
 # Calls that hand the same router back.
-_REF_TAIL = frozenset({"clone", "with_state", "into", "boxed", "to_owned"})
+_REF_TAIL = frozenset(
+    {"clone", "with_state", "into", "boxed", "to_owned", "into_make_service", "into_make_service_with_connect_info"}
+)
 
 
 @dataclass(frozen=True)
@@ -234,7 +236,13 @@ class Chain:
     parent: "Chain | None" = None
     parent_index: int | None = None
     inline_mounts: set[int] = field(default_factory=set)
+    extends: Ref | None = None  # `let api = api.route(..)`: continues the router bound to `api`
     _opens: list[int] = field(default_factory=list, repr=False)
+
+    @property
+    def scope(self) -> int:
+        """The fn a binding lives in (offset of its decl; -1 outside any fn)."""
+        return self.owner[3] if self.owner else -1
 
     def item_at(self, offset: int) -> int | None:
         """Index of the item whose arguments contain ``offset``."""
@@ -293,6 +301,7 @@ def _mount(content: str, link: ra.Link, with_prefix: bool) -> Mount:
 
 
 _AXUM_START = ra._AXUM_START
+_REBIND = re.compile(r"\blet\s+(?:mut\s+)?(\w+)\s*=\s*(\w+)(?=\s*\.\s*(?:route|layer|route_layer|merge|nest|nest_service)\s*\()")
 _POEM_START = re.compile(r"\bRoute\s*::\s*new\s*\(\s*\)")
 _LOCO_START = re.compile(r"\bRoutes\s*::\s*new\s*\(\s*\)")
 _LOCO_APP_START = re.compile(r"\bAppRoutes\s*::\s*(?:with_default_routes|empty)\s*\(\s*\)")
@@ -308,9 +317,19 @@ def axum_like_chains(content: str, file: str, framework: str) -> list[Chain]:
     start_re, route_link = (_AXUM_START, "route") if framework == "axum" else (_POEM_START, "at")
     mounts = ("merge", "nest", "nest_service") if framework == "axum" else ("nest", "nest_no_strip")
     layers = ("layer", "route_layer") if framework == "axum" else ("with", "around")
+    starts: list[tuple[int, int, Ref | None]] = [(m.start(), m.end(), None) for m in start_re.finditer(content)]
+    if framework == "axum":
+        # `let api = api.route(..)`: a chain that continues an earlier binding.
+        for m in _REBIND.finditer(content):
+            starts.append((m.start(2), m.end(2), Ref(m.group(2), (), False, m.start(2))))
+        starts.sort(key=lambda s: s[0])
     chains = []
-    for match in start_re.finditer(content):
-        chain, links = _start_chain(content, file, framework, match.start(), match.end())
+    for start, idx, extends in starts:
+        chain, links = _start_chain(content, file, framework, start, idx)
+        if extends is not None:
+            if not links:
+                continue
+            chain.extends = extends
         for link in links:
             if link.name == route_link:
                 chain.items.append(Item("route", link.start, link.open, link.close))
@@ -451,6 +470,30 @@ def nest_chains(chains: list[Chain]) -> None:
                 chain.parent, chain.parent_index = outer, index
                 outer.inline_mounts.add(index)
         stack.append(chain)
+
+
+# ---------- Served routers ----------
+
+_SERVE_CALL = re.compile(r"\b(?:serve|run|run_with_graceful_shutdown|launch)\s*\(")
+_MAX_SERVE_CALLS = 64
+
+
+def served_refs(content: str) -> list[tuple[Ref, int]]:
+    """Routers handed to a server (``axum::serve(l, app)``, ``.serve(app.into_make_service())``,
+    poem ``.run(app)``, salvo ``.serve(router)``), with the fn they're in.
+    Only these roots count as fully seen: any other unmounted router may be
+    mounted somewhere not visible."""
+    found = []
+    for match in list(_SERVE_CALL.finditer(content))[:_MAX_SERVE_CALLS]:
+        close = ra.matching_close(content, match.end() - 1)
+        if close < 0:
+            continue
+        for start, end in ra.split_args(content, match.end() - 1, close)[:8]:
+            ref = parse_ref(content, start, end)
+            if ref is not None:
+                body = owner(content, match.start())
+                found.append((ref, body[3] if body else -1))
+    return found
 
 
 # ---------- Opaque router names (axum) ----------
@@ -594,6 +637,8 @@ class Registry:
         self.attr_handlers: dict[str, set[str]] = {}  # actix/rocket handler fn -> files
         self.rocket: list[RocketMount] = []
         self.rocket_fns: dict[str, list[tuple[str, int, list[Ref]]]] = {}
+        self.served: list[tuple[Ref, str, int]] = []  # (router ref, file, fn) handed to a server
+        self._served: set[Chain] = set()
         self._final = False
         self._mounted_by: dict[Chain, list[tuple[Chain, int, str | None]]] = {}
         self._services: dict[str, list[tuple[Chain, int, Ref]]] = {}
@@ -613,6 +658,10 @@ class Registry:
         for name, sigs in found.items():
             self.signatures.setdefault(name, []).extend(Handler(file, sig) for _, sig in sigs)
 
+    def add_served(self, refs: list[tuple[Ref, int]], file: str) -> None:
+        self.served.extend((ref, file, scope) for ref, scope in refs)
+        self._final = False
+
     def add_rocket(self, mounts: list[RocketMount], returned: list[tuple[str, int, list[Ref]]], file: str) -> None:
         self.rocket.extend(mounts)
         for name, decl, refs in returned:
@@ -630,8 +679,8 @@ class Registry:
         self._memo.clear()
         self._service_memo.clear()
         self._suffix.clear()
-        # `let` bindings: (family, file, name) -> chains sorted by offset.
-        lets: dict[tuple[str, str, str], list[Chain]] = {}
+        # `let` bindings: (family, file, fn, name) -> chains sorted by offset.
+        lets: dict[tuple[str, str, int, str], list[Chain]] = {}
         # Router fns: (family, name) -> {(file, fn offset): chains}.
         fns: dict[tuple[str, str], dict[tuple[str, int], list[Chain]]] = {}
         # actix root chains by the fn they're in (for `.configure(f)`).
@@ -639,17 +688,34 @@ class Registry:
         for chain in self.chains:
             family = "loco" if chain.framework == "loco_app" else chain.framework
             if chain.name and chain.name_kind == "let":
-                lets.setdefault((family, chain.file, chain.name), []).append(chain)
+                lets.setdefault((family, chain.file, chain.scope, chain.name), []).append(chain)
             elif chain.name and chain.name_kind == "fn":
                 fns.setdefault((family, chain.name), {}).setdefault((chain.file, chain.definition), []).append(chain)
             if chain.framework == "actix" and chain.parent is None and chain.owner is not None:
                 roots.setdefault(chain.owner[2], {}).setdefault((chain.file, chain.owner[3]), []).append(chain)
-        let_starts: dict[tuple[str, str, str], list[int]] = {}
+        let_starts: dict[tuple[str, str, int, str], list[int]] = {}
         for key, bound in lets.items():
             bound.sort(key=lambda c: c.start)
             let_starts[key] = [c.start for c in bound]
+        picked: dict[tuple, list[Chain]] = {}
+
+        def resolve(family: str, ref: Ref, file: str, scope: int) -> list[Chain]:
+            if not ref.call:
+                # A `let` binding: the nearest one before the use, in the same fn.
+                key = (family, file, scope, ref.name)
+                at = bisect.bisect_left(let_starts.get(key, []), ref.offset)
+                return [lets[key][at - 1]] if at > 0 else []
+            memo = (family, ref.name, ref.qualifier, file)
+            if memo not in picked:
+                picked[memo] = pick_definition(fns.get((family, ref.name), {}), ref, file)
+            return picked[memo]
+
         for chain in self.chains:
             family = "loco" if chain.framework == "loco_app" else chain.framework
+            if chain.extends is not None:
+                for target in resolve(family, chain.extends, chain.file, chain.scope):
+                    if target is not chain:
+                        self._mounted_by.setdefault(target, []).append((chain, -1, ""))
             for index, item in enumerate(chain.items):
                 if index in chain.inline_mounts:
                     continue
@@ -657,20 +723,21 @@ class Registry:
                 prefix: str | None = ""
                 if item.kind == "mount" and isinstance(item.value, Mount) and item.value.ref:
                     ref, prefix = item.value.ref, item.value.prefix
-                    if ref.call:
-                        targets = pick_definition(fns.get((family, ref.name), {}), ref, chain.file)
-                    else:
-                        # A `let` binding: the nearest one before the use, in the same file.
-                        key = (family, chain.file, ref.name)
-                        at = bisect.bisect_left(let_starts.get(key, []), ref.offset)
-                        targets = [lets[key][at - 1]] if at > 0 else []
+                    targets = resolve(family, ref, chain.file, chain.scope)
                 elif item.kind == "configure" and isinstance(item.value, Ref):
-                    targets = pick_definition(roots.get(item.value.name, {}), item.value, chain.file)
+                    memo = ("actix-configure", item.value.name, item.value.qualifier, chain.file)
+                    if memo not in picked:
+                        picked[memo] = pick_definition(roots.get(item.value.name, {}), item.value, chain.file)
+                    targets = picked[memo]
                 for target in targets:
                     if target is not chain:
                         self._mounted_by.setdefault(target, []).append((chain, index, prefix))
                 if item.kind == "service" and isinstance(item.value, Ref) and not item.value.call:
                     self._services.setdefault(item.value.name, []).append((chain, index, item.value))
+        self._served = set()
+        for ref, file, scope in self.served:
+            for family in ("axum", "poem", "salvo", "loco"):
+                self._served.update(resolve(family, ref, file, scope))
         self._rocket_refs.clear()
         for mount in self.rocket:
             refs = mount.refs
@@ -726,19 +793,29 @@ class Registry:
         local = PathState(list(guards), clean)
         if chain.framework == "axum" and chain.name and chain.name in self.opaque:
             local.known = False
+        if chain.prefix is None:
+            local.known = False  # its own path isn't a literal
         own = chain.prefix or ""
         parents = self._parents(chain)
         if parents is None or depth >= _MAX_DEPTH:
             local.known = False
             out = [(join_path("", own), local)]
         elif not parents:
+            # A named router that nothing visible mounts may be mounted where we
+            # can't see (another prefix, more layers): only a router handed to a
+            # server, or an unnamed one, is a root.
+            if chain.parent is None and chain.name and chain not in self._served:
+                local.known = False
             out = [(join_path("", own), local)]
         else:
             paths: list[MountPath] = []
             for parent, parent_index, prefix in parents:
                 for outer_prefix, outer in self.mounts(parent, parent_index, depth + 1):
                     full = join_path(join_path(outer_prefix, prefix or ""), own)
-                    paths.append((full, _combine(local, outer)))
+                    state = _combine(local, outer)
+                    if prefix is None:
+                        state.known = False  # mounted under a non-literal prefix
+                    paths.append((full, state))
             out = _merge(paths)
         self._memo[key] = out
         return out

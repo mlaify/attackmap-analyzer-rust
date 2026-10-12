@@ -344,6 +344,14 @@ _EXTRACTOR_IMPL = re.compile(
 _IMPL_BODY = re.compile(r"[^{};]{0,400}\{")
 # An extractor that can't fail never rejects a request.
 _INFALLIBLE = re.compile(r"\btype\s+(?:Rejection|Error)\s*=\s*(?:[\w:]*::)?Infallible\b")
+# What makes an impl an auth check: it reads credentials (an auth header, a
+# cookie, the session, a token) or rejects with 401/403. A rejecting
+# extractor that merely has an auth-like name (`AdminFilters`) isn't one.
+_IMPL_AUTH_EVIDENCE = re.compile(
+    r"\bAUTHORIZATION\b|\bAuthorization\b|\bBearer\b|\bCookie(?:Jar)?\b|\bcookies?\s*\(|\bcookie\s*\("
+    r"|\bSession\b|\bsession\b|\b(?:jwt|token|api_?key)\b|\bdecode\s*(?:::\s*<[^<>]{0,80}>\s*)?\("
+    r"|\bIdentity\b|\bUNAUTHORIZED\b|\bUnauthorized\b|\bFORBIDDEN\b|\bForbidden\b|\b40[13]\b",
+)
 
 # Library extractors that reject anonymous callers, whose impl lives outside
 # the repo: actix-web-httpauth, actix-identity, loco.
@@ -352,16 +360,20 @@ LIBRARY_AUTH_EXTRACTORS = frozenset({"BearerAuth", "BasicAuth", "Identity", "JWT
 
 def extractor_impls(content: str) -> dict[str, list[bool]]:
     """Extractor type -> one flag per ``FromRequest(Parts)`` impl in
-    ``content``: True when the impl can reject."""
+    ``content``: True when the impl can reject and its body checks
+    credentials (``_IMPL_AUTH_EVIDENCE``)."""
     found: dict[str, list[bool]] = {}
     for match in _EXTRACTOR_IMPL.finditer(content):
         body = _IMPL_BODY.match(content, match.end())
-        fallible = True
+        guard = False
         if body:
             close = matching_close(content, body.end() - 1)
-            end = close if close > 0 else body.end()
-            fallible = _INFALLIBLE.search(content, body.end(), min(end, body.end() + _ARG_SCAN)) is None
-        found.setdefault(match.group(1), []).append(fallible)
+            end = min(close if close > 0 else body.end(), body.end() + _ARG_SCAN)
+            guard = (
+                _INFALLIBLE.search(content, body.end(), end) is None
+                and _IMPL_AUTH_EVIDENCE.search(content, body.end(), end) is not None
+            )
+        found.setdefault(match.group(1), []).append(guard)
     return found
 
 

@@ -16,6 +16,7 @@ a way that can be read from one call site, so these routes stay ``unknown``.
 
 from __future__ import annotations
 
+import bisect
 import re
 from dataclasses import dataclass
 
@@ -134,12 +135,16 @@ def tide_routes(content: str) -> list[FoundRoute]:
         if verbs:
             entries.append((match.start(), match.group(1), path, verbs))
 
+    # Bindings are appended in source order, so their offsets are sorted.
+    binding_starts = {name: [b[0] for b in bound] for name, bound in bindings.items()}
+
     def prefix(name: str, offset: int, depth: int) -> str:
         if depth > _MAX_DEPTH:
             return ""
-        bound = [b for b in bindings.get(name, []) if b[0] < offset]
-        if bound:
-            at, receiver, path = max(bound)
+        bound = bindings.get(name, [])
+        index = bisect.bisect_left(binding_starts.get(name, []), offset)
+        if index > 0:
+            at, receiver, path = bound[index - 1]
         elif len(nests.get(name, [])) == 1:
             at, receiver, path = nests[name][0]
         else:

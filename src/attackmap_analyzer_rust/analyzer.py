@@ -226,6 +226,20 @@ def _workspace_members(cargo_path: Path, root: Path | None = None) -> list[str]:
     return re.findall(r'"([^"]+)"', block.group(1))
 
 
+# `use salvo::prelude::*;` / `pub(crate) use poem::{..}` / `extern crate warp;`
+_USE_CRATE = {
+    crate: re.compile(rf"^[ \t]*(?:pub(?:\([^)\n]{{0,40}}\))?[ \t]+)?(?:use|extern[ \t]+crate)[ \t]+(?:::)?{crate}\b", re.MULTILINE)
+    for crate in ("axum", "salvo", "poem", "loco_rs", "warp", "tide")
+}
+# Crate paths used without a `use` line (`warp::path!(..)`, `tide::new()`).
+WARP_PATH_PATTERN = re.compile(r"\bwarp\s*::\s*(?:path!|get\s*\(|post\s*\(|Filter\b|serve\s*\()")
+TIDE_PATH_PATTERN = re.compile(r"\btide\s*::\s*(?:new|with_state|Server|Request)\b")
+
+
+def _uses(content: str, crate: str) -> bool:
+    return _USE_CRATE[crate].search(content) is not None
+
+
 @dataclass
 class _Candidate:
     """A route found in one file, emitted after the walk (#2)."""
@@ -314,13 +328,15 @@ class RustAnalyzer:
         return result
 
     def _emit_routes(self, result: ScanResult, registry: rt.Registry, pending: list[_Candidate]) -> None:
+        # (path, method, file) already emitted: a set, so dedup stays linear.
+        seen = {(r.path, r.method, r.file) for r in result.routes}
         for cand in pending:
             for prefix, state, sig in self._expand(registry, cand):
                 if prefix in ("", "/") and cand.path:
                     path = cand.path
                 else:
                     path = rt.join_path(prefix, cand.path)
-                index = self._append_unique_route(result, path, cand.method, cand.file, cand.line)
+                index = self._append_unique_route(result, path, cand.method, cand.file, cand.line, seen=seen)
                 if index is not None:
                     self._set_route_auth(result, index, ra.resolve(state, sig))
 
@@ -358,18 +374,22 @@ class RustAnalyzer:
         pending = pending if pending is not None else []
         before = len(pending)
 
-        salvo_file = "salvo" in content and "axum" not in content
+        # Frameworks that share builder names are told apart by what the file
+        # imports, not by words that might sit in a comment.
+        salvo_file = _uses(content, "salvo") and not _uses(content, "axum")
         groups = [
             rt.axum_like_chains(content, relative, "axum") if "Router" in content and not salvo_file else [],
             rt.actix_chains(content, relative) if "actix" in content else [],
-            rt.axum_like_chains(content, relative, "poem") if "poem" in content and "Route" in content else [],
+            rt.axum_like_chains(content, relative, "poem") if "Route" in content and _uses(content, "poem") else [],
             rt.salvo_chains(content, relative) if salvo_file and "Router" in content else [],
-            rt.loco_chains(content, relative) if "Routes" in content else [],
+            rt.loco_chains(content, relative) if "Routes" in content and _uses(content, "loco_rs") else [],
         ]
         for group in groups:
             rt.nest_chains(group)
             registry.add_chains(group)
         axum, actix, poem, salvo, loco = groups
+        if axum or poem or salvo or loco:
+            registry.add_served(rt.served_refs(content), relative)
         if axum:
             dots = {item.dot for chain in axum for item in chain.items}
             registry.opaque |= rt.opaque_router_names(content, dots)
@@ -505,10 +525,10 @@ class RustAnalyzer:
             registry.add_rocket(*rt.rocket_mounts(content, relative), relative)
 
         # warp path! filters and tide app.at("/x").get(h) chains.
-        if "warp" in content:
+        if "warp" in content and (_uses(content, "warp") or WARP_PATH_PATTERN.search(content)):
             for found in fw.warp_routes(content):
                 add(found.path, found.method, found.offset, "plain")
-        if "tide" in content:
+        if "tide" in content and (_uses(content, "tide") or TIDE_PATH_PATTERN.search(content)):
             for found in fw.tide_routes(content):
                 add(found.path, found.method, found.offset, "plain")
 
@@ -632,11 +652,17 @@ class RustAnalyzer:
         auth: str = ra.UNKNOWN,
         guards: list[str] | None = None,
         guard_evidence: str | None = None,
+        seen: set[tuple[str, str, str]] | None = None,
     ) -> int | None:
         """Append a route once per (path, method, file); return its index, or
-        None when it was already recorded."""
+        None when it was already recorded. ``seen`` (the keys already in
+        ``result.routes``) replaces the linear scan."""
         key = (path, method, file)
-        if any((item.path, item.method, item.file) == key for item in result.routes):
+        if seen is not None:
+            if key in seen:
+                return None
+            seen.add(key)
+        elif any((item.path, item.method, item.file) == key for item in result.routes):
             return None
         result.routes.append(
             Route(

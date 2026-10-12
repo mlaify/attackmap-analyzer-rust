@@ -374,6 +374,8 @@ pub fn routes() -> Routes {
 }
 """,
             "src/app.rs": """
+use loco_rs::{controller::AppRoutes, prelude::*};
+
 fn routes(_ctx: &AppContext) -> AppRoutes {
     AppRoutes::with_default_routes()
         .prefix("/api")
@@ -500,7 +502,10 @@ where
     S: Send + Sync,
 {
     type Rejection = AuthError;
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> { todo!() }
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let header = parts.headers.get(AUTHORIZATION).ok_or(AuthError::Missing)?;
+        todo!()
+    }
 }
 
 impl<S: Send + Sync> FromRequestParts<S> for MaybeAdmin {
@@ -579,3 +584,172 @@ def test_adversarial_nesting_and_fan_in_stay_fast(tmp_path: Path) -> None:
     # The nested leaf is past the depth bound: emitted, with a bounded prefix.
     leaf = [r for r in result.routes if r.path.endswith("/leaf")]
     assert len(leaf) == 1 and leaf[0].path.count("/") <= 18
+
+
+# ---------- Review fixes ----------
+
+_OPTIONAL_USER = """
+async fn opt(user: Option<AuthUser>) {}
+impl<S: Send + Sync> FromRequestParts<S> for AuthUser {
+    type Rejection = StatusCode;
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, StatusCode> {
+        parts.headers.get(AUTHORIZATION).ok_or(StatusCode::UNAUTHORIZED)?;
+        todo!()
+    }
+}
+"""
+
+
+def test_let_binding_in_another_fn_is_not_a_mount(tmp_path: Path) -> None:
+    routes = _routes(
+        tmp_path,
+        {
+            "src/main.rs": _OPTIONAL_USER
+            + """
+use axum::{middleware, routing::get, Router};
+fn public_routes() -> Router {
+    let api = Router::new().route("/feed", get(opt));
+    api
+}
+fn protected(api: Router) -> Router {
+    // `api` is this fn's parameter, not public_routes()'s binding.
+    Router::new().nest("/admin", api).route_layer(middleware::from_fn(require_auth))
+}
+""",
+        },
+    )
+    assert "GET /admin/feed" not in routes
+    assert routes["GET /feed"].auth == "unknown"
+
+
+def test_unseen_mounts_and_dynamic_prefixes_are_not_known_roots(tmp_path: Path) -> None:
+    routes = _routes(
+        tmp_path,
+        {
+            "src/main.rs": _OPTIONAL_USER
+            + """
+use axum::{routing::get, Router};
+fn api_routes() -> Router { Router::new().route("/me", get(opt)) }
+fn build(r: Router) -> Router { Router::new().nest("/api", r).route_layer(from_fn(require_auth)) }
+
+#[tokio::main]
+async fn main() {
+    let other = build(api_routes());
+    let app = Router::new()
+        .route("/public", get(opt))
+        .nest(&format!("/{}", base), Router::new().route("/dynamic", get(opt)));
+    axum::serve(listener, app).await.unwrap();
+}
+""",
+        },
+    )
+    # Mounted through `build(..)`, which isn't visible as a mount: not a known root.
+    assert routes["GET /me"].auth == "unknown"
+    # Under a non-literal prefix.
+    assert routes["GET /dynamic"].auth == "unknown"
+    # The served root itself is fully seen.
+    assert routes["GET /public"].auth == "anonymous"
+
+
+def test_rejecting_extractor_without_credential_checks_is_not_auth(tmp_path: Path) -> None:
+    routes = _routes(
+        tmp_path,
+        {
+            "src/main.rs": """
+use axum::{routing::get, Router};
+async fn list(filters: AdminFilters) {}
+impl<S: Send + Sync> FromRequestParts<S> for AdminFilters {
+    type Rejection = StatusCode;
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, StatusCode> {
+        let query = parts.uri.query().ok_or(StatusCode::BAD_REQUEST)?;
+        serde_urlencoded::from_str(query).map_err(|_| StatusCode::BAD_REQUEST)
+    }
+}
+fn main() { let app = Router::new().route("/admin/users", get(list)); axum::serve(l, app); }
+""",
+        },
+    )
+    assert routes["GET /admin/users"].auth == "unknown"
+
+
+def test_salvo_word_in_a_comment_keeps_axum_parsing(tmp_path: Path) -> None:
+    routes = _routes(
+        tmp_path,
+        {
+            "src/routes.rs": """
+use crate::prelude::*; // unlike salvo, routers here nest by prefix
+fn app() -> Router { Router::new().nest("/api", Router::new().route("/x", get(h))) }
+""",
+        },
+    )
+    assert "GET /api/x" in routes
+
+
+def test_rebinding_continues_the_router(tmp_path: Path) -> None:
+    routes = _routes(
+        tmp_path,
+        {
+            "src/main.rs": """
+use axum::{middleware, routing::get, Router};
+fn main() {
+    let api = Router::new().route("/a", get(a));
+    let api = api.route("/b", get(b)).route_layer(middleware::from_fn(require_auth));
+    let app = Router::new().nest("/api/", api).nest("/root/", Router::new().route("/", get(r)));
+    axum::serve(listener, app);
+}
+""",
+        },
+    )
+    assert routes["GET /api/a"].auth == "required"
+    assert routes["GET /api/b"].auth == "required"
+    # "/root/" + "/" is "/root".
+    assert "GET /root" in routes and "GET /root/" not in routes
+
+
+def test_many_tide_bindings_stay_fast(tmp_path: Path) -> None:
+    n = 20000
+    source = "use tide;\nfn main() {\n" + "".join(
+        f'    let mut a = app.at("/p{i}");\n    a.at("/x").get(h);\n' for i in range(n)
+    ) + "}\n"
+    (tmp_path / "main.rs").write_text(source, encoding="utf-8")
+    started = time.monotonic()
+    result = RustAnalyzer().analyze(tmp_path)
+    # Each receiver lookup is a bisect, not a scan of every binding, and
+    # route dedup is a set lookup.
+    assert time.monotonic() - started < 8
+    assert any(r.path == f"/p{n - 1}/x" for r in result.routes)
+
+
+def test_many_router_definitions_and_mounts_stay_fast(tmp_path: Path) -> None:
+    # 200 `fn routes()` in m0.rs..m199.rs, mounted 3000 times (15 each, under the per-router bound) as `mN::routes()`.
+    for i in range(200):
+        (tmp_path / f"m{i}.rs").write_text(
+            f'pub fn routes() -> Router {{ Router::new().route("/r{i}", get(h)) }}\n', encoding="utf-8"
+        )
+    mounts = "fn app() {\n" + "".join(f'    let a{i} = Router::new().nest("/p", m{i % 200}::routes());\n' for i in range(3000)) + "}\n"
+    (tmp_path / "main.rs").write_text("use axum::Router;\n" + mounts, encoding="utf-8")
+    started = time.monotonic()
+    result = RustAnalyzer().analyze(tmp_path)
+    assert time.monotonic() - started < 8
+    assert any(r.path == "/p/r199" for r in result.routes)
+
+
+def test_pick_definition_is_memoized_per_name_qualifier_and_file(tmp_path: Path, monkeypatch) -> None:
+    from attackmap_analyzer_rust import routing
+
+    calls = []
+    real = routing.pick_definition
+
+    def counting(defs, ref, from_file):
+        calls.append((ref.name, ref.qualifier, from_file))
+        return real(defs, ref, from_file)
+
+    monkeypatch.setattr(routing, "pick_definition", counting)
+    for i in range(3):
+        (tmp_path / f"m{i}.rs").write_text(f'pub fn routes() -> Router {{ Router::new().route("/r{i}", get(h)) }}\n')
+    mounts = "".join(f'    let a{i} = Router::new().nest("/p{i}", m{i % 3}::routes());\n' for i in range(12))
+    (tmp_path / "main.rs").write_text("use axum::Router;\nfn app() {\n" + mounts + "}\n")
+    routes = {r.path for r in RustAnalyzer().analyze(tmp_path).routes}
+    assert {"/p0/r0", "/p4/r1", "/p11/r2"} <= routes
+    mount_calls = [c for c in calls if c[0] == "routes"]
+    assert len(mount_calls) == len(set(mount_calls)) == 3

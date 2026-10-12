@@ -498,7 +498,13 @@ pub async fn update_me(claims: Claims, Json(b): Json<Me>) -> impl IntoResponse {
 _AXUM_EXTRACTORS = """
 impl<S: Send + Sync> FromRequestParts<S> for Claims {
     type Rejection = AuthError;
-    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> { todo!() }
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        let TypedHeader(Authorization(bearer)) = parts
+            .extract::<TypedHeader<Authorization<Bearer>>>()
+            .await
+            .map_err(|_| AuthError::InvalidToken)?;
+        todo!()
+    }
 }
 
 impl<S> axum::extract::FromRequestParts<S> for AuthUser
@@ -506,7 +512,9 @@ where
     S: Send + Sync,
 {
     type Rejection = (StatusCode, &'static str);
-    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> { todo!() }
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        Err((StatusCode::UNAUTHORIZED, "login required"))
+    }
 }
 
 impl<S: Send + Sync> OptionalFromRequestParts<S> for AuthUser {
@@ -556,7 +564,10 @@ use axum::{middleware, routing::post, Router};
 async fn feed(user: Option<AuthUser>) {}
 async fn inbox(user: Option<AuthUser>) {}
 async fn login(session: AuthSession) {}
-impl<S: Send + Sync> FromRequestParts<S> for AuthUser { type Rejection = StatusCode; }
+impl<S: Send + Sync> FromRequestParts<S> for AuthUser {
+    type Rejection = StatusCode;
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, StatusCode> { Err(StatusCode::UNAUTHORIZED) }
+}
 fn main() {
     let a = Router::new()
         .route("/feed", post(feed))
@@ -633,7 +644,12 @@ fn remove(admin_id: AdminId) -> Status { Status::Ok }
 #[rocket::async_trait]
 impl<'r> FromRequest<'r> for AuthUser {
     type Error = ();
-    async fn from_request(req: &'r Request<'_>) -> request::Outcome<Self, ()> { todo!() }
+    async fn from_request(req: &'r Request<'_>) -> request::Outcome<Self, ()> {
+        match req.cookies().get_private("user_id") {
+            Some(_) => todo!(),
+            None => request::Outcome::Error((Status::Unauthorized, ())),
+        }
+    }
 }
 
 #[launch]
