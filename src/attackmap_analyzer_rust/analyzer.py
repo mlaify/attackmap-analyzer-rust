@@ -1,7 +1,8 @@
 """Rust ecosystem analyzer for AttackMap.
 
 Coverage (v0.1):
-- Web frameworks: axum, actix-web, rocket (route + entrypoint extraction)
+- Web frameworks: axum, actix-web, rocket, poem, salvo, loco, warp, tide (routes
+  with the prefixes of the routers that mount them; entrypoints)
 - Databases: sqlx, diesel, sea-orm, mongodb, redis, rusqlite, tokio-postgres
 - Auth crates: jsonwebtoken, argon2/bcrypt/scrypt, oauth2, tower-http auth, axum-login,
   actix-identity, tower-sessions
@@ -17,12 +18,15 @@ downstream insights can cite `path/to/file.rs:NN`.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
 from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
 
+from . import frameworks as fw
 from . import route_auth as ra
+from . import routing as rt
 from .contracts import (
     AnalyzerMetadata,
     AuthHint,
@@ -49,7 +53,7 @@ _SNIPPET_MAX_CHARS = 160
 # Axum: Router::new().route("/path", get(h).post(h2))
 # We capture the path then walk a restricted method-chain that follows.
 AXUM_ROUTE_PATTERN = re.compile(
-    r'\.route\(\s*"([^"]+)"\s*,\s*([a-zA-Z_][a-zA-Z0-9_:]*)\s*\(',
+    r'\.route\(\s*"([^"]*)"\s*,\s*([a-zA-Z_][a-zA-Z0-9_:]*)\s*\(',
     re.MULTILINE,
 )
 # Method-chain on the routing function, e.g. get(h).post(h2)
@@ -68,9 +72,17 @@ ACTIX_WEB_ROUTE_PATTERN = re.compile(
     r'\.route\(\s*"([^"]+)"\s*,\s*web::(get|post|put|delete|patch|head|options)\s*\(\s*\)',
     re.IGNORECASE,
 )
-# Actix-web service routes: web::resource("/path").route(web::get().to(...))
+# Actix-web service routes: web::resource("/path").route(web::get().to(...)).
+# Kept for API compatibility; resources and scopes are parsed as chains
+# (routing.actix_chains), which also joins their prefixes.
 ACTIX_RESOURCE_PATTERN = re.compile(
     r'web::(?:resource|scope)\(\s*"([^"]+)"',
+    re.IGNORECASE,
+)
+# The method of an actix route: `web::get()`, bare `get()` (imported), or
+# `web::method(Method::POST)`.
+ACTIX_METHOD_PATTERN = re.compile(
+    r"\s*(?:web\s*::\s*)?(get|post|put|delete|patch|head|options|trace|connect|method)\s*\(\s*(?:(?:http\s*::\s*)?Method\s*::\s*(\w+))?",
     re.IGNORECASE,
 )
 
@@ -214,6 +226,23 @@ def _workspace_members(cargo_path: Path, root: Path | None = None) -> list[str]:
     return re.findall(r'"([^"]+)"', block.group(1))
 
 
+@dataclass
+class _Candidate:
+    """A route found in one file, emitted after the walk (#2)."""
+
+    path: str  # as written, before any prefix
+    method: str
+    file: str
+    line: int | None
+    # "chain": item `where` of a router chain; "service": actix attribute
+    # handler; "rocket": rocket handler; "plain": no router context.
+    kind: str
+    where: tuple | None = None
+    handler: object = None  # handler name / Ref
+    sig: ra.Signature | None = None
+    prefix: str = ""
+
+
 class RustAnalyzer:
     metadata = AnalyzerMetadata(
         name="rust",
@@ -256,10 +285,10 @@ class RustAnalyzer:
         for member in workspace_members:
             self._append_unique_service(result, f"workspace_member:{member}", "Cargo.toml")
 
-        # Route auth is resolved after the walk: routers are merged and
-        # handlers defined across files (AttackMap#256).
-        registry = ra.Registry()
-        pending: list[tuple] = []
+        # Routes are emitted after the walk: their prefixes and auth come from
+        # routers mounted and handlers defined across files (#2, AttackMap#256).
+        registry = rt.Registry()
+        pending: list[_Candidate] = []
         for file_path in iter_repo_files(root, suffixes=CODE_SUFFIXES, skip_dirs=SKIP_DIRS):
             content = read_source(file_path, root=root)
             if content is None:
@@ -279,25 +308,38 @@ class RustAnalyzer:
             self._extract_entrypoints(content, relative, result)
             self._infer_service_role(content, relative, result)
 
-        for entry in pending:
-            self._set_route_auth(result, entry[0], self._resolve_pending(registry, entry))
+        self._emit_routes(result, registry, pending)
 
         result.languages.sort()
         return result
 
+    def _emit_routes(self, result: ScanResult, registry: rt.Registry, pending: list[_Candidate]) -> None:
+        for cand in pending:
+            for prefix, state, sig in self._expand(registry, cand):
+                if prefix in ("", "/") and cand.path:
+                    path = cand.path
+                else:
+                    path = rt.join_path(prefix, cand.path)
+                index = self._append_unique_route(result, path, cand.method, cand.file, cand.line)
+                if index is not None:
+                    self._set_route_auth(result, index, ra.resolve(state, sig))
+
     @staticmethod
-    def _resolve_pending(registry: ra.Registry, entry: tuple) -> ra.Resolution:
-        _, kind, where, handler, sig = entry
-        if kind == "axum":
-            path = registry.axum_path(*where) if where else ra.PathState(known=False)
-            return ra.resolve(path, registry.signature(handler))
-        if kind == "actix_route":
-            path = registry.actix_path(where) if where else ra.PathState(known=False)
-            return ra.resolve(path, registry.signature(handler))
-        if kind == "actix_attr":
-            return ra.resolve(registry.actix_service_path(handler), sig)
-        # Rocket has no route middleware: request guards are the whole story.
-        return ra.resolve(ra.PathState(), sig)
+    def _expand(registry: rt.Registry, cand: _Candidate) -> list[tuple[str, ra.PathState, ra.Signature | None]]:
+        """``(prefix, layers, handler signature)`` for each path the route is
+        reachable under."""
+        if cand.kind == "chain" and cand.where is not None:
+            sig = registry.signature(cand.handler, cand.file)
+            return [(p, state, sig) for p, state in registry.mounts(*cand.where)]
+        if cand.kind == "service":
+            sig = registry.confirm(cand.sig)
+            return [(p, state, sig) for p, state in registry.service_mounts(str(cand.handler), cand.file)]
+        if cand.kind == "rocket":
+            # Rocket has no route middleware: request guards are the whole story.
+            sig = registry.confirm(cand.sig)
+            return [(p, ra.PathState(), sig) for p in registry.rocket_prefixes(str(cand.handler), cand.file)]
+        sig = registry.signature(cand.handler, cand.file) if cand.handler else None
+        return [(cand.prefix, ra.PathState(known=False), sig)]
 
     # ---------- Extractors ----------
 
@@ -306,24 +348,45 @@ class RustAnalyzer:
         content: str,
         relative: str,
         result: ScanResult,
-        registry: ra.Registry | None = None,
-        pending: list[tuple] | None = None,
+        registry: rt.Registry | None = None,
+        pending: list[_Candidate] | None = None,
     ) -> None:
-        registry = registry if registry is not None else ra.Registry()
+        """Collect route candidates; ``analyze`` emits them once every file
+        is read. Called on its own (no registry), it emits them directly."""
+        standalone = registry is None
+        registry = registry if registry is not None else rt.Registry()
         pending = pending if pending is not None else []
-        axum = ra.axum_chains(content, relative) if "Router" in content else []
-        actix = ra.actix_chains(content, relative) if "actix" in content else []
-        registry.add_chains(axum + actix)
-        dots = {dot for chain in axum for dot in chain.dots}
-        registry.opaque |= ra.opaque_router_names(content, axum, dots) if axum else set()
+        before = len(pending)
+
+        salvo_file = "salvo" in content and "axum" not in content
+        groups = [
+            rt.axum_like_chains(content, relative, "axum") if "Router" in content and not salvo_file else [],
+            rt.actix_chains(content, relative) if "actix" in content else [],
+            rt.axum_like_chains(content, relative, "poem") if "poem" in content and "Route" in content else [],
+            rt.salvo_chains(content, relative) if salvo_file and "Router" in content else [],
+            rt.loco_chains(content, relative) if "Routes" in content else [],
+        ]
+        for group in groups:
+            rt.nest_chains(group)
+            registry.add_chains(group)
+        axum, actix, poem, salvo, loco = groups
+        if axum:
+            dots = {item.dot for chain in axum for item in chain.items}
+            registry.opaque |= rt.opaque_router_names(content, dots)
         signatures = ra.fn_signatures(content)
-        registry.add_signatures(signatures)
+        registry.add_signatures(relative, signatures)
+        if "FromRequest" in content:
+            for name, flags in ra.extractor_impls(content).items():
+                registry.extractors.setdefault(name, []).extend(flags)
         route_items = {
-            value: (chain, i)
+            item.dot: (chain, i)
             for chain in axum + actix
-            for i, (kind, value) in enumerate(chain.items)
-            if kind == "route"
+            for i, item in enumerate(chain.items)
+            if item.kind == "route"
         }
+
+        def add(path: str, method: str, offset: int, kind: str, **kw) -> None:
+            pending.append(_Candidate(path, method, relative, line_of(content, offset), kind, **kw))
 
         # axum: .route("/x", get(h).post(h2)) — pull every method in the routing chain.
         # The capture-group regex sits on the *first* method call (e.g. `get(`); after the opening
@@ -331,15 +394,27 @@ class RustAnalyzer:
         _http_verbs = {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT"}
         for match in AXUM_ROUTE_PATTERN.finditer(content):
             path = match.group(1)
-            line = line_of(content, match.start())
+            where = route_items.get(match.start())
+            # `.route("/x", web::post().to(h))` inside an actix App/scope chain
+            # also matches here; it is resolved as actix.
+            actix_route = where is not None and where[0].framework == "actix"
+            if not path and not actix_route:
+                continue  # only an actix scope route may be empty ("" is the scope itself)
+            close = ra.matching_close(content, content.find("(", match.start()))
+            if actix_route:
+                to = ACTIX_TO_PATTERN.search(content, match.end(), close) if close > 0 else None
+                method = self._actix_method(content, match.start(2), close)
+                add(path, method, match.start(), "chain", where=where, handler=to.group(1) if to else None)
+                continue
             methods: set[str] = set()
             # First method is the one captured in group 2 (when it's an HTTP verb).
             first_call = match.group(2).split("::")[-1].upper()
             if first_call in _http_verbs:
                 methods.add(first_call)
-            # Walk a bounded window for chained `.post(...)` / `.delete(...)` etc., stopping at
-            # the next .route( or Router::new boundary so we don't pull from the next entry.
-            chain_window = content[match.end(): match.end() + 300]
+            # Walk the rest of the `.route(..)` call for chained `.post(...)` / `.delete(...)`
+            # etc., bounded, and stopping at the next .route( or Router::new boundary.
+            window_end = close if close > 0 else match.end() + 300
+            chain_window = content[match.end() : min(window_end, match.end() + 300)]
             stop = chain_window.find(".route(")
             stop_alt = chain_window.find("Router::new")
             if stop_alt != -1 and (stop == -1 or stop_alt < stop):
@@ -350,59 +425,106 @@ class RustAnalyzer:
                 methods.add(chain_match.group(1).upper())
             if not methods:
                 methods = {"ANY"}
-            close = ra.matching_close(content, content.find("(", match.start()))
             handlers = ra.handlers_by_method(content, match.start(2), close) if close > 0 else {}
-            where = route_items.get(match.start())
-            # `.route("/x", web::post().to(h))` inside an actix App/scope chain
-            # also matches here; it is resolved as actix.
-            actix_route = where is not None and where[0].framework == "actix"
-            if actix_route:
-                to = ACTIX_TO_PATTERN.search(content, match.end(), close) if close > 0 else None
             for method in sorted(methods):
-                index = self._append_unique_route(result, path, method, relative, line)
-                if index is None:
-                    continue
-                if actix_route:
-                    pending.append((index, "actix_route", where[0], to.group(1) if to else None, None))
-                else:
-                    pending.append((index, "axum", where, handlers.get(method), None))
+                add(path, method, match.start(), "chain" if where else "plain", where=where,
+                    handler=handlers.get(method))
 
-        # actix attribute routes: #[get("/path")] just above an fn
+        # actix web::resource("/x").route(web::get().to(h)) / .to(h): the
+        # resource's own path is the route's.
+        for chain in actix:
+            if not chain.resource:
+                continue
+            for i, item in enumerate(chain.items):
+                if item.kind != "route":
+                    continue
+                args = ra.split_args(content, item.open, item.close)
+                if item.value == "to":
+                    handler = rt.parse_ref(content, *args[0]) if len(args) == 1 else None
+                    add("", "ANY", item.dot, "chain", where=(chain, i), handler=handler)
+                elif len(args) == 1 and rt.literal(content, *args[0]) is None:
+                    to = ACTIX_TO_PATTERN.search(content, item.open, item.close)
+                    method = self._actix_method(content, item.open + 1, item.close)
+                    add("", method, item.dot, "chain", where=(chain, i), handler=to.group(1) if to else None)
+
+        # poem Route::new().at("/x", get(h).post(h2)) and loco Routes::new().add("/x", get(h)).
+        for chain in poem + loco:
+            for i, item in enumerate(chain.items):
+                if item.kind != "route":
+                    continue
+                args = ra.split_args(content, item.open, item.close)
+                path = rt.literal(content, *args[0]) if len(args) == 2 else None
+                if path is None:
+                    continue
+                handlers = ra.handlers_by_method(content, args[1][0], args[1][1])
+                if not handlers:
+                    add(path, "ANY", item.dot, "chain", where=(chain, i), handler=rt.parse_ref(content, *args[1]))
+                for method, handler in handlers.items():
+                    add(path, method, item.dot, "chain", where=(chain, i), handler=handler)
+
+        # salvo Router::with_path("x").get(h): the router's own path is the route's.
+        for chain in salvo:
+            for i, item in enumerate(chain.items):
+                if item.kind == "route":
+                    args = ra.split_args(content, item.open, item.close)
+                    handler = rt.parse_ref(content, *args[0]) if len(args) == 1 else None
+                    add("", str(item.value), item.dot, "chain", where=(chain, i), handler=handler)
+
+        # actix / rocket attribute routes: #[get("/path")] just above an fn
         is_rocket = "rocket" in content.lower() and "actix_web" not in content
         for match in ACTIX_ATTRIBUTE_ROUTE_PATTERN.finditer(content):
             method, path = match.group(1).upper(), match.group(2)
-            index = self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
-            if index is None:
-                continue
             fn = FN_AFTER_ATTRIBUTE_PATTERN.search(content, match.end(), match.end() + 600)
             sig = None
             if fn:
                 sig = next((s for offset, s in signatures.get(fn.group(1), []) if offset == fn.start()), None)
+                registry.attr_handlers.setdefault(fn.group(1), set()).add(relative)
+            handler = fn.group(1) if fn else None
             if is_rocket:
                 if sig is not None:
                     attr_end = content.find("]", match.end())
                     attr = content[match.start() : attr_end if attr_end > 0 else match.end()]
                     sig = sig.without_params(set(ROCKET_PATH_PARAM_PATTERN.findall(attr)))
-                pending.append((index, "rocket", None, None, sig))
+                add(path, method, match.start(), "rocket" if handler else "plain", handler=handler, sig=sig)
+            elif handler:
+                add(path, method, match.start(), "service", handler=handler, sig=sig)
             else:
-                pending.append((index, "actix_attr", None, fn.group(1) if fn else None, sig))
+                add(path, method, match.start(), "plain")
 
         # actix .route(...): only fires when web:: namespace appears (so it doesn't double-count axum)
         for match in ACTIX_WEB_ROUTE_PATTERN.finditer(content):
             path, method = match.group(1), match.group(2).upper()
-            index = self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
-            if index is None:
-                continue
             close = ra.matching_close(content, content.find("(", match.start()))
             to = ACTIX_TO_PATTERN.search(content, match.end(), close) if close > 0 else None
             where = route_items.get(match.start())
-            pending.append((index, "actix_route", where[0] if where else None, to.group(1) if to else None, None))
+            add(path, method, match.start(), "chain" if where else "plain", where=where,
+                handler=to.group(1) if to else None)
 
-        # rocket attribute routes — same shape as actix attribute regex; emit only if rocket markers present.
-        if "rocket" in content.lower():
-            for match in ROCKET_ATTRIBUTE_ROUTE_PATTERN.finditer(content):
-                method, path = match.group(1).upper(), match.group(2)
-                self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
+        # rocket .mount("/base", routes![..]) prefixes.
+        if "routes!" in content or ("mount" in content and "rocket" in content.lower()):
+            registry.add_rocket(*rt.rocket_mounts(content, relative), relative)
+
+        # warp path! filters and tide app.at("/x").get(h) chains.
+        if "warp" in content:
+            for found in fw.warp_routes(content):
+                add(found.path, found.method, found.offset, "plain")
+        if "tide" in content:
+            for found in fw.tide_routes(content):
+                add(found.path, found.method, found.offset, "plain")
+
+        if standalone:
+            self._emit_routes(result, registry, pending[before:])
+            del pending[before:]
+
+    @staticmethod
+    def _actix_method(content: str, start: int, end: int) -> str:
+        """``web::get()`` / ``get()`` / ``web::method(Method::POST)`` -> verb."""
+        match = ACTIX_METHOD_PATTERN.match(content, start, end)
+        if not match:
+            return "ANY"
+        if match.group(1).lower() == "method":
+            return match.group(2).upper() if match.group(2) else "ANY"
+        return match.group(1).upper()
 
     def _extract_databases(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern, kind in DB_PATTERNS:

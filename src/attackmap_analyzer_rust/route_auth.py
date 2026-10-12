@@ -15,9 +15,12 @@ verifiably says.
 - **actix-web** — ``.wrap(L)`` on ``App::new()`` / ``web::scope(...)`` wraps
   every service in it, nested scopes included. ``.service(handler)``
   links attribute-macro handlers to the scope that mounts them.
-- **Extractor / request guards** (axum, actix, rocket) — a handler argument
-  whose type is an auth extractor (``Claims``, ``AuthUser``, ``CurrentUser``,
-  ``BearerAuth``, ``Identity``, ``Jwt<..>``, ...) rejects anonymous callers.
+- **Extractor / request guards** (axum, actix, rocket, poem, loco) — a handler
+  argument whose type is named like an auth extractor (``Claims``, ``AuthUser``,
+  ``CurrentUser``, ``Jwt<..>``, ...) rejects anonymous callers when its
+  ``FromRequestParts`` / ``FromRequest`` impl is in the repo and can fail, or
+  when it is a known library extractor (``BearerAuth``, ``Identity``, loco
+  ``JWT``).
   ``Option<AuthUser>`` explicitly admits them: when no auth layer applies and
   every layer on the path is a known non-auth one, the route is
   ``anonymous``.
@@ -30,7 +33,9 @@ A layer is a guard when its constructor or ``from_fn`` function names auth
 ``unknown``.
 
 Linear: brackets are matched in one cached pass per file, argument lists are
-split by jumping over nested closures, and lookups are bounded.
+split by jumping over nested closures, and lookups are bounded. Router chains,
+mounts and prefixes live in ``routing.py``; this module holds the shared
+bracket scanner, layer and extractor classification, and ``resolve``.
 """
 
 from __future__ import annotations
@@ -245,7 +250,7 @@ def classify_layer(content: str, start: int, end: int, evidence: str) -> Layer:
 
 _FN_DECL = re.compile(r"\bfn\s+(\w+)\s*(?:<[^<>{}()]*>\s*)?\(")
 _GUARD_TYPE = re.compile(
-    r"auth(?!or)|claims|jwt|bearer|current_?user|logged_?in|session_?user|identity|api_?key|admin",
+    r"auth(?!or)|claims|jwt|bearer|current_?user|logged_?(?:in|user)|session_?user|identity|api_?key|admin",
     re.IGNORECASE,
 )
 # Extractors that load an optional user without rejecting.
@@ -327,121 +332,45 @@ def fn_signatures(content: str) -> dict[str, list[tuple[int, Signature]]]:
     return found
 
 
-# ---------- Router chains ----------
+# ---------- Extractor impls ----------
+
+# `impl<S> FromRequestParts<S> for AuthUser` / `impl FromRequest for Identity`
+# / `impl<'r> FromRequest<'r> for User`: the extractor is defined in the repo.
+# (`OptionalFromRequestParts`, which backs `Option<T>`, doesn't count.)
+_EXTRACTOR_IMPL = re.compile(
+    r"\bimpl\b[^{};]{0,300}?\b(?:FromRequestParts|FromRequest)\b"
+    r"[^{};]{0,200}?\bfor\s+(?:[A-Za-z_]\w*::){0,8}([A-Za-z_]\w*)"
+)
+_IMPL_BODY = re.compile(r"[^{};]{0,400}\{")
+# An extractor that can't fail never rejects a request.
+_INFALLIBLE = re.compile(r"\btype\s+(?:Rejection|Error)\s*=\s*(?:[\w:]*::)?Infallible\b")
+
+# Library extractors that reject anonymous callers, whose impl lives outside
+# the repo: actix-web-httpauth, actix-identity, loco.
+LIBRARY_AUTH_EXTRACTORS = frozenset({"BearerAuth", "BasicAuth", "Identity", "JWT", "JWTWithUser"})
+
+
+def extractor_impls(content: str) -> dict[str, list[bool]]:
+    """Extractor type -> one flag per ``FromRequest(Parts)`` impl in
+    ``content``: True when the impl can reject."""
+    found: dict[str, list[bool]] = {}
+    for match in _EXTRACTOR_IMPL.finditer(content):
+        body = _IMPL_BODY.match(content, match.end())
+        fallible = True
+        if body:
+            close = matching_close(content, body.end() - 1)
+            end = close if close > 0 else body.end()
+            fallible = _INFALLIBLE.search(content, body.end(), min(end, body.end() + _ARG_SCAN)) is None
+        found.setdefault(match.group(1), []).append(fallible)
+    return found
+
+
+# ---------- Router chains (shared patterns; see routing.py) ----------
 
 _AXUM_START = re.compile(r"\bRouter\s*(?:::\s*<[^<>]*>\s*)?::\s*new\s*\(\s*\)")
-_ACTIX_START = re.compile(r"\bApp\s*::\s*new\s*\(\s*\)|\bweb\s*::\s*scope\s*\(")
 _LET_NAME = re.compile(r"let\s+(?:mut\s+)?(\w+)\s*(?::[^=;{}]{0,120})?=\s*$")
 _FN_RETURNING = re.compile(r"\bfn\s+(\w+)\s*(?:<[^<>{}]{0,120}>)?\s*\([^{};]{0,400}\)[^{};]{0,200}\{\s*$")
-_REF_NAME = re.compile(r"\s*(?:&\s*)?([\w:]+)\s*(?:\(\s*[^()]{0,200}\))?\s*(?:\.\s*clone\s*\(\s*\))?\s*$")
 _HANDLER_CALL = re.compile(r"\b(?:get|post|put|delete|patch|head|options|trace|any)\s*\(\s*([\w:]+)\s*\)")
-
-
-@dataclass
-class Chain:
-    framework: str  # "axum" | "actix"
-    file: str
-    start: int
-    name: str | None
-    end: int
-    # In order: ("route", offset) / ("layer", Layer) / ("mount", ref name)
-    # / ("service", fn name) / ("scope", chain start offset)
-    items: list[tuple[str, object]] = field(default_factory=list)
-    parent: "Chain | None" = None  # actix: the chain whose argument holds this scope
-    dots: list[int] = field(default_factory=list)  # offsets of each link's `.`
-
-
-def _chain_name(content: str, start: int) -> str | None:
-    window = content[max(0, start - 600) : start]
-    let = _LET_NAME.search(window[-200:])
-    if let:
-        return let.group(1)
-    func = _FN_RETURNING.search(window)
-    return func.group(1) if func else None
-
-
-def _ref_name(content: str, start: int, end: int) -> str | None:
-    text = content[start : min(end, start + 300)]
-    match = _REF_NAME.match(text)
-    return match.group(1).split("::")[-1] if match else None
-
-
-_ROUTER_CALL = re.compile(r"(\w+)?\s*\.\s*(merge|nest|nest_service|layer|route_layer)\s*\(")
-
-
-def opaque_router_names(content: str, chains: list[Chain], links: set[int]) -> set[str]:
-    """Router names used by ``.layer`` / ``.merge`` / ``.nest`` calls that
-    aren't part of a parsed ``Router::new()`` chain (``links``: the offsets of
-    the chain links' dots)."""
-    names: set[str] = set()
-    for match in _ROUTER_CALL.finditer(content):
-        dot = content.rfind(".", 0, match.start(2) + 1)
-        if dot in links:
-            continue
-        if match.group(1):
-            names.add(match.group(1))
-        if match.group(2) in ("merge", "nest", "nest_service"):
-            close = matching_close(content, match.end() - 1)
-            args = split_args(content, match.end() - 1, close) if close > 0 else []
-            if args and (target := _ref_name(content, *args[-1])):
-                names.add(target)
-    return names
-
-
-def axum_chains(content: str, file: str) -> list[Chain]:
-    chains = []
-    for match in _AXUM_START.finditer(content):
-        links = parse_chain(content, match.end())
-        chain = Chain("axum", file, match.start(), _chain_name(content, match.start()),
-                      links[-1].close if links else match.end())
-        chain.dots = [link.start for link in links]
-        for link in links:
-            if link.name == "route":
-                chain.items.append(("route", link.start))
-            elif link.name in ("layer", "route_layer"):
-                evidence = clip(content[link.start : min(link.close + 1, link.start + 2 * _EVIDENCE_MAX)])
-                chain.items.append(("layer", classify_layer(content, link.open + 1, link.close, evidence)))
-            elif link.name in ("merge", "nest", "nest_service"):
-                args = split_args(content, link.open, link.close)
-                target = args[-1] if args else None
-                if target is not None:
-                    chain.items.append(("mount", _ref_name(content, *target)))
-        chains.append(chain)
-    return chains
-
-
-def actix_chains(content: str, file: str) -> list[Chain]:
-    chains: list[Chain] = []
-    for match in _ACTIX_START.finditer(content):
-        idx = match.end()
-        if match.group().endswith("("):  # web::scope("...")
-            close = matching_close(content, match.end() - 1)
-            if close < 0:
-                continue
-            idx = close + 1
-        links = parse_chain(content, idx)
-        chain = Chain("actix", file, match.start(), None, links[-1].close if links else idx)
-        for link in links:
-            if link.name == "wrap":
-                evidence = clip(content[link.start : min(link.close + 1, link.start + 2 * _EVIDENCE_MAX)])
-                chain.items.append(("layer", classify_layer(content, link.open + 1, link.close, evidence)))
-            elif link.name == "route":
-                chain.items.append(("route", link.start))
-            elif link.name == "service":
-                name = _ref_name(content, link.open + 1, link.close)
-                if name is not None:
-                    chain.items.append(("service", name))
-        chains.append(chain)
-    # A scope inside another chain's arguments is nested in it.
-    ordered = sorted(chains, key=lambda c: c.start)
-    stack: list[Chain] = []
-    for chain in ordered:
-        while stack and stack[-1].end < chain.start:
-            stack.pop()
-        if stack:
-            chain.parent = stack[-1]
-        stack.append(chain)
-    return chains
 
 
 @dataclass
@@ -458,116 +387,6 @@ class PathState:
     guards: list[Layer] = field(default_factory=list)
     clean: bool = True  # every layer on the path is a known non-auth one
     known: bool = True  # the whole path was followed
-
-
-class Registry:
-    """Router chains and handler signatures across the repo."""
-
-    def __init__(self) -> None:
-        self.axum: dict[str, list[Chain]] = {}  # router name -> chains bound to it
-        self.mounts: dict[str, list[tuple[Chain, int]]] = {}  # router name -> (mounting chain, item index)
-        self.actix_services: dict[str, list[Chain]] = {}  # handler fn -> chains mounting it
-        self.signatures: dict[str, list[Signature]] = {}
-        # Router names also touched outside a parsed chain (`app = app.layer(..)`,
-        # `app.merge(api)`): their full layer path isn't visible.
-        self.opaque: set[str] = set()
-        self._memo: dict[tuple[str, int], PathState] = {}
-
-    def add_chains(self, chains: list[Chain]) -> None:
-        for chain in chains:
-            if chain.framework == "axum" and chain.name:
-                self.axum.setdefault(chain.name, []).append(chain)
-            for index, (kind, value) in enumerate(chain.items):
-                if kind == "mount" and value:
-                    self.mounts.setdefault(str(value), []).append((chain, index))
-                elif kind == "service":
-                    self.actix_services.setdefault(str(value), []).append(chain)
-
-    def add_signatures(self, found: dict[str, list[tuple[int, Signature]]]) -> None:
-        for name, sigs in found.items():
-            self.signatures.setdefault(name, []).extend(sig for _, sig in sigs)
-
-    # -- layer paths --
-
-    def axum_path(self, chain: Chain, index: int, depth: int = 0) -> PathState:
-        """Layers wrapping item ``index`` of ``chain``, up through every router
-        that mounts it. Several mount points must agree."""
-        state = PathState()
-        for kind, value in chain.items[index + 1 :]:
-            if kind == "layer":
-                layer = value  # type: ignore[assignment]
-                if layer.kind == "auth":
-                    state.guards.append(layer)
-                elif layer.kind == "other":
-                    state.clean = False
-        if state.guards or not chain.name:
-            return state
-        mounted = self._mounted(chain.name, depth)
-        state.guards = mounted.guards
-        state.clean = state.clean and mounted.clean
-        state.known = mounted.known
-        return state
-
-    def _mounted(self, name: str, depth: int) -> PathState:
-        """Layers every mount point of router ``name`` adds; several mount
-        points must agree. Memoized per (name, depth), so fan-in stays linear."""
-        key = (name, depth)
-        cached = self._memo.get(key)
-        if cached is not None:
-            return cached
-        state = PathState()
-        if depth >= _MAX_DEPTH or len(self.axum.get(name, [])) > 1 or name in self.opaque:
-            state.known = False  # too deep, bound twice, or touched outside a chain
-        else:
-            refs = self.mounts.get(name, [])
-            if len(refs) > _MAX_REFS:
-                state.known = False
-            elif refs:
-                parents = [self.axum_path(parent, i, depth + 1) for parent, i in refs]
-                if all(p.guards for p in parents):
-                    state.guards = [g for p in parents for g in p.guards]
-                state.clean = all(p.clean for p in parents)
-                state.known = all(p.known for p in parents)
-        self._memo[key] = state
-        return state
-
-    def actix_path(self, chain: Chain | None, depth: int = 0) -> PathState:
-        state = PathState()
-        while chain is not None and depth < _MAX_DEPTH:
-            for kind, value in chain.items:
-                if kind == "layer":
-                    layer = value  # type: ignore[assignment]
-                    if layer.kind == "auth":
-                        state.guards.append(layer)
-                    elif layer.kind == "other":
-                        state.clean = False
-            chain = chain.parent
-            depth += 1
-        if chain is not None:
-            state.known = False
-        return state
-
-    def actix_service_path(self, handler: str) -> PathState:
-        chains = self.actix_services.get(handler, [])
-        if not chains or len(chains) > _MAX_REFS:
-            return PathState(known=False)
-        paths = [self.actix_path(c) for c in chains]
-        state = PathState()
-        if all(p.guards for p in paths):
-            state.guards = [g for p in paths for g in p.guards]
-        state.clean = all(p.clean for p in paths)
-        state.known = all(p.known for p in paths)
-        return state
-
-    # -- handlers --
-
-    def signature(self, handler: str | None) -> Signature | None:
-        if not handler:
-            return None
-        sigs = self.signatures.get(handler.split("::")[-1], [])
-        if len(sigs) != 1:
-            return None  # unknown, or ambiguous across modules
-        return sigs[0]
 
 
 def resolve(path: PathState, sig: Signature | None) -> Resolution:

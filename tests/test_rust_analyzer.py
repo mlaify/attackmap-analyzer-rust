@@ -495,9 +495,28 @@ pub async fn create_comment(user: Option<AuthUser>, Json(c): Json<NewComment>) -
 pub async fn update_me(claims: Claims, Json(b): Json<Me>) -> impl IntoResponse {}
 """
 
+_AXUM_EXTRACTORS = """
+impl<S: Send + Sync> FromRequestParts<S> for Claims {
+    type Rejection = AuthError;
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> { todo!() }
+}
+
+impl<S> axum::extract::FromRequestParts<S> for AuthUser
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, &'static str);
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> { todo!() }
+}
+
+impl<S: Send + Sync> OptionalFromRequestParts<S> for AuthUser {
+    type Rejection = Infallible;
+}
+"""
+
 
 def test_axum_route_layer_and_extractor_guards_are_required(tmp_path: Path) -> None:
-    routes = _analyze_files(tmp_path, {"src/main.rs": _AXUM_MAIN, "src/handlers.rs": _AXUM_HANDLERS})
+    routes = _analyze_files(tmp_path, {"src/main.rs": _AXUM_MAIN, "src/handlers.rs": _AXUM_HANDLERS, "src/auth.rs": _AXUM_EXTRACTORS})
     # route_layer in a router returned by fn and merged into the app.
     create = routes["POST /posts"]
     assert create.auth == "required"
@@ -513,7 +532,7 @@ def test_axum_route_layer_and_extractor_guards_are_required(tmp_path: Path) -> N
 
 
 def test_axum_optional_extractor_is_explicitly_public(tmp_path: Path) -> None:
-    routes = _analyze_files(tmp_path, {"src/main.rs": _AXUM_MAIN, "src/handlers.rs": _AXUM_HANDLERS})
+    routes = _analyze_files(tmp_path, {"src/main.rs": _AXUM_MAIN, "src/handlers.rs": _AXUM_HANDLERS, "src/auth.rs": _AXUM_EXTRACTORS})
     comment = routes["POST /comments"]
     assert comment.auth == "anonymous"
     assert comment.guards == []
@@ -521,7 +540,7 @@ def test_axum_optional_extractor_is_explicitly_public(tmp_path: Path) -> None:
 
 
 def test_axum_route_after_route_layer_opts_out_of_it(tmp_path: Path) -> None:
-    routes = _analyze_files(tmp_path, {"src/main.rs": _AXUM_MAIN, "src/handlers.rs": _AXUM_HANDLERS})
+    routes = _analyze_files(tmp_path, {"src/main.rs": _AXUM_MAIN, "src/handlers.rs": _AXUM_HANDLERS, "src/auth.rs": _AXUM_EXTRACTORS})
     # Same router as the guarded /posts, but registered after the route_layer.
     preview = routes["POST /posts/preview"]
     assert preview.auth == "anonymous"
@@ -537,6 +556,7 @@ use axum::{middleware, routing::post, Router};
 async fn feed(user: Option<AuthUser>) {}
 async fn inbox(user: Option<AuthUser>) {}
 async fn login(session: AuthSession) {}
+impl<S: Send + Sync> FromRequestParts<S> for AuthUser { type Rejection = StatusCode; }
 fn main() {
     let a = Router::new()
         .route("/feed", post(feed))
@@ -583,11 +603,13 @@ async fn main() {
 """,
         },
     )
-    account = routes["PUT /account"]
+    # Mounted in web::scope("/api"), so the scope prefix is joined.
+    assert "PUT /account" not in routes
+    account = routes["PUT /api/account"]
     assert account.auth == "required"
     assert account.guards == ["HttpAuthentication::bearer"]
     assert account.guard_evidence == ".wrap(HttpAuthentication::bearer(validator))"
-    assert routes["POST /tokens"].auth == "required"
+    assert routes["POST /api/tokens"].auth == "required"
     assert routes["POST /signup"].auth == "anonymous"
     assert routes["POST /signup"].guard_evidence == "ident: Option<Identity>"
 
@@ -607,6 +629,12 @@ fn sign(user: Option<AuthUser>, entry: Json<Entry>) -> Status { Status::Ok }
 
 #[delete("/admin/<admin_id>")]
 fn remove(admin_id: AdminId) -> Status { Status::Ok }
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for AuthUser {
+    type Error = ();
+    async fn from_request(req: &'r Request<'_>) -> request::Outcome<Self, ()> { todo!() }
+}
 
 #[launch]
 fn rocket() -> _ { rocket::build() }
