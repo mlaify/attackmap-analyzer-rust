@@ -255,6 +255,8 @@ _GUARD_TYPE = re.compile(
 )
 # Extractors that load an optional user without rejecting.
 _NOT_GUARD_TYPE = re.compile(r"^(?:AuthSession|Session|TypedHeader|HeaderMap|Authorization)$")
+# `MaybeAuthUser`, `OptionalUser`, `OptAuth`: named as admitting anonymous callers.
+_OPTIONAL_TYPE = re.compile(r"(?:Maybe|Optional|Opt)(?=[A-Z_])")
 _WORD = re.compile(r"\w+")
 _TYPE_HEAD = re.compile(r"\s*(?:&\s*)?(?:'\w+\s+)?(?:mut\s+)?([\w:]+)\s*(<)?")
 
@@ -303,7 +305,7 @@ def _classify_type(type_text: str) -> tuple[str, str] | None:
         return ("optional", inner[1]) if inner and inner[0] == "guard" else None
     if name in ("Extension", "State", "Json", "Form", "Query", "Path", "Data", "web"):
         return None
-    if _NOT_GUARD_TYPE.match(name) or not _GUARD_TYPE.search(name):
+    if _NOT_GUARD_TYPE.match(name) or _OPTIONAL_TYPE.match(name) or not _GUARD_TYPE.search(name):
         return None
     return "guard", name
 
@@ -348,10 +350,25 @@ _INFALLIBLE = re.compile(r"\btype\s+(?:Rejection|Error)\s*=\s*(?:[\w:]*::)?Infal
 # cookie, the session, a token) or rejects with 401/403. A rejecting
 # extractor that merely has an auth-like name (`AdminFilters`) isn't one.
 _IMPL_AUTH_EVIDENCE = re.compile(
-    r"\bAUTHORIZATION\b|\bAuthorization\b|\bBearer\b|\bCookie(?:Jar)?\b|\bcookies?\s*\(|\bcookie\s*\("
+    r"\bAUTHORIZATION\b|\bAuthorization\b|\bBearer\b|\bCOOKIE\b|\bCookie(?:Jar)?\b|\bcookies?\s*\(|\bcookie\s*\("
     r"|\bSession\b|\bsession\b|\b(?:jwt|token|api_?key)\b|\bdecode\s*(?:::\s*<[^<>]{0,80}>\s*)?\("
     r"|\bIdentity\b|\bUNAUTHORIZED\b|\bUnauthorized\b|\bFORBIDDEN\b|\bForbidden\b|\b40[13]\b",
 )
+
+# ...and it must have a way to reject a request that lacks them. An extractor
+# that only parses credentials when present (`MaybeAuthUser`:
+# `Ok(Self(headers.get(AUTHORIZATION).map(..).transpose()?))`) admits anonymous
+# callers, so a bare `?` doesn't count.
+_IMPL_REJECTS = re.compile(
+    r"\.\s*ok_or(?:_else)?\s*\("
+    r"|\breturn\s+(?:[\w:]+\s*\(\s*)?Err\s*\("
+    r"|\bErr\s*\([^;]{0,200}?\b(?:UNAUTHORIZED|Unauthorized|Unauthenticated|FORBIDDEN|Forbidden|40[13])\b"
+    r"|\bOutcome\s*::\s*(?:Error|Failure|Forward)\s*\([^;]{0,120}?\b(?:Unauthorized|Forbidden)\b"
+    r"|\bNone\s*=>\s*(?:return\s+)?[\w:]*(?:Err|Error|Failure)\b"
+)
+# A required typed header extraction rejects when the header is missing
+# (`parts.extract::<TypedHeader<Authorization<Bearer>>>().await.map_err(..)?`).
+_REQUIRED_TYPED_HEADER = re.compile(r"(?<!Option<)\bTypedHeader\s*<\s*Authorization\b")
 
 # Library extractors that reject anonymous callers, whose impl lives outside
 # the repo: actix-web-httpauth, actix-identity, loco.
@@ -360,8 +377,9 @@ LIBRARY_AUTH_EXTRACTORS = frozenset({"BearerAuth", "BasicAuth", "Identity", "JWT
 
 def extractor_impls(content: str) -> dict[str, list[bool]]:
     """Extractor type -> one flag per ``FromRequest(Parts)`` impl in
-    ``content``: True when the impl can reject and its body checks
-    credentials (``_IMPL_AUTH_EVIDENCE``)."""
+    ``content``: True when the impl can reject, its body checks credentials
+    (``_IMPL_AUTH_EVIDENCE``) and it rejects when they're missing
+    (``_IMPL_REJECTS``)."""
     found: dict[str, list[bool]] = {}
     for match in _EXTRACTOR_IMPL.finditer(content):
         body = _IMPL_BODY.match(content, match.end())
@@ -372,6 +390,10 @@ def extractor_impls(content: str) -> dict[str, list[bool]]:
             guard = (
                 _INFALLIBLE.search(content, body.end(), end) is None
                 and _IMPL_AUTH_EVIDENCE.search(content, body.end(), end) is not None
+                and (
+                    _IMPL_REJECTS.search(content, body.end(), end) is not None
+                    or _REQUIRED_TYPED_HEADER.search(content, body.end(), end) is not None
+                )
             )
         found.setdefault(match.group(1), []).append(guard)
     return found

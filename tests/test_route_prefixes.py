@@ -753,3 +753,101 @@ def test_pick_definition_is_memoized_per_name_qualifier_and_file(tmp_path: Path,
     assert {"/p0/r0", "/p4/r1", "/p11/r2"} <= routes
     mount_calls = [c for c in calls if c[0] == "routes"]
     assert len(mount_calls) == len(set(mount_calls)) == 3
+
+
+_REALWORLD_EXTRACTORS = """
+pub struct AuthUser { pub user_id: Uuid }
+pub struct MaybeAuthUser(pub Option<AuthUser>);
+
+impl<S> FromRequestParts<S> for AuthUser where S: Send + Sync {
+    type Rejection = Error;
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let ctx: Extension<ApiContext> = Extension::from_request_parts(parts, state).await.expect("ctx");
+        let auth_header = parts.headers.get(AUTHORIZATION).ok_or(Error::Unauthorized)?;
+        Self::from_authorization(&ctx, auth_header)
+    }
+}
+
+impl<S> FromRequestParts<S> for MaybeAuthUser where S: Send + Sync {
+    type Rejection = Error;
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let ctx: Extension<ApiContext> = Extension::from_request_parts(parts, state).await.expect("ctx");
+        Ok(Self(
+            parts.headers.get(AUTHORIZATION)
+                .map(|auth_header| AuthUser::from_authorization(&ctx, auth_header))
+                .transpose()?,
+        ))
+    }
+}
+"""
+
+
+def test_optional_user_extractor_is_not_a_guard(tmp_path: Path) -> None:
+    routes = _routes(
+        tmp_path,
+        {
+            "src/http/extractor.rs": _REALWORLD_EXTRACTORS,
+            "src/http/profiles.rs": """
+use axum::{routing::{get, post}, Router};
+pub(crate) fn router() -> Router {
+    Router::new()
+        .route("/api/profiles/:username", get(get_user_profile))
+        .route("/api/profiles/:username/follow", post(follow_user))
+}
+async fn get_user_profile(maybe_auth_user: MaybeAuthUser, Path(username): Path<String>) {}
+async fn follow_user(auth_user: AuthUser, Path(username): Path<String>) {}
+""",
+        },
+    )
+    # Only parses a token when one is sent; anonymous callers get through.
+    assert routes["GET /api/profiles/:username"].auth == "unknown"
+    # `ok_or(Error::Unauthorized)?` on a missing header rejects them.
+    assert routes["POST /api/profiles/:username/follow"].auth == "required"
+    assert routes["POST /api/profiles/:username/follow"].guards == ["AuthUser"]
+
+
+def test_extractor_must_reject_missing_credentials(tmp_path: Path) -> None:
+    routes = _routes(
+        tmp_path,
+        {
+            "src/main.rs": """
+use axum::{routing::get, Router};
+async fn a(user: CurrentUser) {}
+async fn b(user: OptionalAuth) {}
+async fn c(user: SessionUser) {}
+fn main() { let app = Router::new().route("/a", get(a)).route("/b", get(b)).route("/c", get(c)); axum::serve(l, app); }
+
+// Reads the cookie but never rejects when it's absent.
+impl<S: Send + Sync> FromRequestParts<S> for CurrentUser {
+    type Rejection = StatusCode;
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, StatusCode> {
+        let jar = CookieJar::from_headers(&parts.headers);
+        Ok(Self(jar.get("sid").map(|c| c.value().to_owned())))
+    }
+}
+
+// Rejects, but its name says it's optional.
+impl<S: Send + Sync> FromRequestParts<S> for OptionalAuth {
+    type Rejection = StatusCode;
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, StatusCode> {
+        parts.headers.get(AUTHORIZATION).ok_or(StatusCode::UNAUTHORIZED)?;
+        todo!()
+    }
+}
+
+// Early return when the session cookie is absent.
+impl<S: Send + Sync> FromRequestParts<S> for SessionUser {
+    type Rejection = Response;
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Response> {
+        let Some(cookie) = parts.headers.get(COOKIE) else {
+            return Err(Redirect::to("/login").into_response());
+        };
+        todo!()
+    }
+}
+""",
+        },
+    )
+    assert routes["GET /a"].auth == "unknown"
+    assert routes["GET /b"].auth == "unknown"
+    assert routes["GET /c"].auth == "required"
