@@ -22,23 +22,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
-from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
-
-from . import frameworks as fw
-from . import route_auth as ra
-from . import routing as rt
-from .contracts import (
+from attackmap.sdk import (
+    DEFAULT_SKIP_DIRS,
     AnalyzerMetadata,
     AuthHint,
     DatabaseHint,
     EntrypointHint,
     ExternalCall,
     FrameworkHint,
+    iter_repo_files,
+    line_of,
+    read_source,
+    rel,
     Route,
     ScanResult,
     SecretHint,
     ServiceHint,
 )
+
+from . import frameworks as fw
+from . import route_auth as ra
+from . import routing as rt
 
 CODE_SUFFIXES = {".rs"}
 # Rust-specific directories on top of the SDK defaults (which already cover
