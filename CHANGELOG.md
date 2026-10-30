@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — JWT auth hints need a verifying decode (#9, AttackMap#325)
+
+- The `jwt` auth hint used to match any `jsonwebtoken::` path, including `use` lines and `jsonwebtoken::encode`. It now comes from a `decode(…)` / `decode::<T>(…)` call that passes a validation (jsonwebtoken's `decode` checks the signature), and only in files that use the crate. `encode`, `decode_header` and imports don't count. A file that calls `insecure_disable_signature_validation()` gets no hint. Core credits any auth hint near a route as that route's auth.
+- On lemmy@75a7b06: the hint in `crates/api/api_utils/src/claims.rs` moved from the `use` line to the `decode::<Claims>(jwt, &key, &validation)` call. Routes, findings and surface risk are unchanged.
+
 ### Added — route prefixes and more frameworks (#2, AttackMap#261)
 
 - **Routes carry their full mounted path.** Routes are emitted after the whole repo is read, joined to the prefixes of every router that mounts them:

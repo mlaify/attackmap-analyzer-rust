@@ -205,10 +205,10 @@ def test_diesel_mongodb_redis_each_get_distinct_kinds(tmp_path: Path) -> None:
 
 def test_jsonwebtoken_argon2_oauth2_each_emit_auth_hints_with_high_confidence(tmp_path: Path) -> None:
     (tmp_path / "auth.rs").write_text(
-        "use jsonwebtoken::{encode, Header};\n"
+        "use jsonwebtoken::{decode, DecodingKey, Validation};\n"
         "use argon2::Argon2;\n"
         "use oauth2::basic::BasicClient;\n"
-        "fn _x() {}\n",
+        "fn _x() { let _ = decode::<Claims>(t, &key, &Validation::default()); }\n",
         encoding="utf-8",
     )
     result = RustAnalyzer().analyze(tmp_path)
@@ -381,6 +381,7 @@ def test_full_axum_service_produces_expected_signal_set(tmp_path: Path) -> None:
         "#[tokio::main]\n"
         "async fn main() {\n"
         '    let _secret = std::env::var("JWT_SECRET").unwrap();\n'
+        "    let _ = decode::<Claims>(&token, &key, &validation);\n"
         '    let _ = reqwest::get("https://api.example.com/data").await;\n'
         '    let app = Router::new().route("/login", post(handler)).route("/me", get(handler));\n'
         "    axum::serve(listener, app).await.unwrap();\n"
@@ -662,3 +663,40 @@ fn rocket() -> _ { rocket::build() }
     assert routes["POST /guestbook"].auth == "anonymous"
     # `admin_id` is bound from the path, not a request guard.
     assert routes["DELETE /admin/<admin_id>"].auth == "unknown"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "use jsonwebtoken::{encode, Header};\n",
+        "// TODO: verify the JWT\nuse jsonwebtoken::DecodingKey;\n",
+        "use jsonwebtoken::{encode, Header};\nfn s() { let _ = encode(&Header::default(), &c, &key); }\n",
+        "use jsonwebtoken::decode_header;\nfn h() { let _ = decode_header(&t); }\n",
+        "use jsonwebtoken::{decode, Validation};\n"
+        "fn d() { let mut v = Validation::default(); v.insecure_disable_signature_validation();\n"
+        "  let _ = decode::<C>(&t, &k, &v); }\n",
+        # a decode with a validation, but not jsonwebtoken's
+        "fn b() { let _ = base64::decode(&s).map_err(|_| Validation::Bad); }\n",
+    ],
+)
+def test_jwt_hint_needs_a_verifying_decode(tmp_path: Path, body: str) -> None:
+    (tmp_path / "auth.rs").write_text(body, encoding="utf-8")
+    result = RustAnalyzer().analyze(tmp_path)
+    assert not any(h.hint == "jwt" for h in result.auth_hints)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        "decode::<Claims>(&token, &key, &validation)",
+        "jsonwebtoken::decode::<Claims>(&token, &key, &Validation::new(Algorithm::RS256))",
+        "decode::<Claims>(\n    &token,\n    &DecodingKey::from_secret(s),\n    &Validation::default(),\n)",
+    ],
+)
+def test_jwt_hint_from_verifying_decode(tmp_path: Path, call: str) -> None:
+    (tmp_path / "auth.rs").write_text(
+        f"use jsonwebtoken::{{decode, DecodingKey, Validation}};\nfn v() {{ let _ = {call}; }}\n",
+        encoding="utf-8",
+    )
+    hints = [h for h in RustAnalyzer().analyze(tmp_path).auth_hints if h.hint == "jwt"]
+    assert [h.line for h in hints] == [2]
