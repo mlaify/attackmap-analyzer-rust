@@ -134,9 +134,13 @@ DB_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\baws_sdk_dynamodb::", re.IGNORECASE), "dynamodb"),
 ]
 
-# Auth-related signals (pattern, hint label)
+# Auth-related signals (pattern, hint label). Core credits any auth hint near a
+# route as that route's auth, so `jwt` needs a verifying call (AttackMap#325):
+# jsonwebtoken's `decode(token, &key, &validation)` checks the signature, while
+# `use` lines, `encode` and `decode_header` authenticate nobody. Only counted in
+# files that use the crate; see `_extract_auth`.
 AUTH_PATTERNS: list[tuple[re.Pattern[str], str, float]] = [
-    (re.compile(r"\bjsonwebtoken::", re.IGNORECASE), "jwt", 0.85),
+    (re.compile(r"\bdecode(?:::<[^>]{0,80}>)?\s*\([^;]{0,300}?\b[Vv]alidation\b"), "jwt", 0.85),
     (re.compile(r"\bargon2::", re.IGNORECASE), "argon2", 0.9),
     (re.compile(r"\bbcrypt::", re.IGNORECASE), "bcrypt", 0.9),
     (re.compile(r"\bscrypt::", re.IGNORECASE), "scrypt", 0.9),
@@ -564,7 +568,10 @@ class RustAnalyzer:
             )
 
     def _extract_auth(self, content: str, relative: str, result: ScanResult) -> None:
+        jwt_verifies = "jsonwebtoken" in content and "insecure_disable_signature_validation" not in content
         for pattern, hint, confidence in AUTH_PATTERNS:
+            if hint == "jwt" and not jwt_verifies:
+                continue
             match = pattern.search(content)
             if match is None:
                 continue
