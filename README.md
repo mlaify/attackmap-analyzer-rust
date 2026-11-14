@@ -24,8 +24,8 @@ All emissions populate AttackMap's Signal v2 fields (line numbers, evidence snip
 ## Install
 
 ```bash
-uv tool install attackmap --with attackmap-analyzer-rust \
-  --index mlaify=https://pkg.mlaify.io/pypi/simple/ --index-strategy first-index
+uv tool install attackmap --with attackmap-analyzer-rust    # from PyPI
+# or: pip install attackmap-analyzer-rust    (installs attackmap too)
 # or from source:
 pip install git+https://github.com/mlaify/attackmap-analyzer-rust.git
 ```
