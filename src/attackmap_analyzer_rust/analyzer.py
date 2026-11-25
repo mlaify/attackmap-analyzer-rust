@@ -270,7 +270,7 @@ class RustAnalyzer:
     metadata = AnalyzerMetadata(
         name="rust",
         display_name="Rust Analyzer",
-        version=plugin_version("attackmap-analyzer-rust", default="0.2.1"),
+        version=plugin_version("attackmap-analyzer-rust", default="0.3.0"),
         requires_core=">=0.8,<2",
         description="Rust ecosystem analyzer covering axum, actix-web, rocket, common DB/auth crates, and reqwest.",
         scope="Rust crates and workspaces. Cargo-bearing repos are auto-detected; pure .rs trees also work.",

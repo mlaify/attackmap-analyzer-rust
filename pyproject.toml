@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "attackmap-analyzer-rust"
-version = "0.2.1"
+version = "0.3.0"
 description = "Rust ecosystem analyzer plugin for AttackMap (axum, actix-web, rocket; sqlx/diesel/sea-orm; jsonwebtoken/argon2; reqwest)."
 readme = "README.md"
 requires-python = ">=3.11"
